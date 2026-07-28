@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2025 Baldur Karlsson
+ * Copyright (c) 2018-2026 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -176,7 +176,12 @@ void VulkanGraphicsTest::Prepare(int argc, char **argv)
 
       X11Window::Init();
 #elif defined(__APPLE__)
+#if defined(VK_USE_PLATFORM_METAL_EXT)
+      enabledInstExts.push_back(VK_EXT_METAL_SURFACE_EXTENSION_NAME);
+#endif
+#if defined(VK_USE_PLATFORM_MACOS_MVK)
       enabledInstExts.push_back(VK_MVK_MACOS_SURFACE_EXTENSION_NAME);
+#endif
 
       AppleWindow::Init();
 #else
@@ -731,8 +736,7 @@ bool VulkanGraphicsTest::Init()
     queueCreates.push_back(vkh::DeviceQueueCreateInfo(transferQueueFamilyIndex, 1, priorities));
 
   CHECK_VKR(vkCreateDevice(
-      phys, vkh::DeviceCreateInfo(queueCreates, enabledLayers, devExts, features).next(devInfoNext),
-      NULL, &device));
+      phys, vkh::DeviceCreateInfo(queueCreates, devExts, features).next(devInfoNext), NULL, &device));
 
   volkLoadDevice(device);
 
@@ -1051,6 +1055,12 @@ void VulkanGraphicsTest::setName(VkPipeline obj, const std::string &name)
 }
 
 template <>
+void VulkanGraphicsTest::setName(VkPipelineLayout obj, const std::string &name)
+{
+  setName(VK_OBJECT_TYPE_PIPELINE_LAYOUT, (uint64_t)obj, name);
+}
+
+template <>
 void VulkanGraphicsTest::setName(VkFramebuffer obj, const std::string &name)
 {
   setName(VK_OBJECT_TYPE_FRAMEBUFFER, (uint64_t)obj, name);
@@ -1102,6 +1112,36 @@ template <>
 void VulkanGraphicsTest::setName(VkAccelerationStructureKHR obj, const std::string &name)
 {
   setName(VK_OBJECT_TYPE_ACCELERATION_STRUCTURE_KHR, (uint64_t)obj, name);
+}
+
+template <>
+void VulkanGraphicsTest::setName(VkDescriptorSetLayout obj, const std::string &name)
+{
+  setName(VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT, (uint64_t)obj, name);
+}
+
+template <>
+void VulkanGraphicsTest::setName(VkDescriptorSet obj, const std::string &name)
+{
+  setName(VK_OBJECT_TYPE_DESCRIPTOR_SET, (uint64_t)obj, name);
+}
+
+template <>
+void VulkanGraphicsTest::setName(VkRenderPass obj, const std::string &name)
+{
+  setName(VK_OBJECT_TYPE_RENDER_PASS, (uint64_t)obj, name);
+}
+
+template <>
+void VulkanGraphicsTest::setName(VkCommandBuffer obj, const std::string &name)
+{
+  setName(VK_OBJECT_TYPE_COMMAND_BUFFER, (uint64_t)obj, name);
+}
+
+template <>
+void VulkanGraphicsTest::setName(VkCommandPool obj, const std::string &name)
+{
+  setName(VK_OBJECT_TYPE_COMMAND_POOL, (uint64_t)obj, name);
 }
 
 void VulkanGraphicsTest::setName(VkObjectType objType, uint64_t obj, const std::string &name)
@@ -1506,6 +1546,15 @@ VulkanWindow::VulkanWindow(VulkanGraphicsTest *test, GraphicsWindow *win)
 
     vkCreateXcbSurfaceKHR(m_Test->instance, &createInfo, NULL, &surface);
 #elif defined(__APPLE__)
+#if defined(VK_USE_PLATFORM_METAL_EXT)
+    VkMetalSurfaceCreateInfoEXT mtlCreateInfo;
+    mtlCreateInfo.sType = VK_STRUCTURE_TYPE_METAL_SURFACE_CREATE_INFO_EXT;
+    mtlCreateInfo.pNext = NULL;
+    mtlCreateInfo.flags = 0;
+    mtlCreateInfo.pLayer = ((AppleWindow *)win)->layer;
+    vkCreateMetalSurfaceEXT(m_Test->instance, &mtlCreateInfo, NULL, &surface);
+#endif
+#if defined(VK_USE_PLATFORM_MACOS_MVK)
     VkMacOSSurfaceCreateInfoMVK createInfo;
 
     createInfo.sType = VK_STRUCTURE_TYPE_MACOS_SURFACE_CREATE_INFO_MVK;
@@ -1513,6 +1562,7 @@ VulkanWindow::VulkanWindow(VulkanGraphicsTest *test, GraphicsWindow *win)
     createInfo.flags = 0;
     createInfo.pView = ((AppleWindow *)win)->view;
     vkCreateMacOSSurfaceMVK(m_Test->instance, &createInfo, NULL, &surface);
+#endif
 #else
 #error UNKNOWN PLATFORM
 #endif
@@ -1641,6 +1691,16 @@ bool VulkanWindow::CreateSwapchain()
         vkh::AttachmentDescription(format, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL));
 
     renderPassCreateInfo.addSubpass({VkAttachmentReference({0, VK_IMAGE_LAYOUT_GENERAL})});
+
+    // add deps to allow clear/copy on the main target before or after
+    renderPassCreateInfo.dependencies.push_back(vkh::SubpassDependency(
+        ~0U, 0, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT));
+    renderPassCreateInfo.dependencies.push_back(vkh::SubpassDependency(
+        0, ~0U, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT));
 
     rp = m_Test->createRenderPass(renderPassCreateInfo);
   }

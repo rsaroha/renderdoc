@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2025 Baldur Karlsson
+ * Copyright (c) 2016-2026 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -417,11 +417,13 @@ public:
   {
     rdcarray<IID> allowedIIDs;
 
-    // allow enabling unsigned DXIL.
+    // allow enabling unsigned DXIL, and GPU upload heaps on most windows versions
     for(UINT i = 0; i < NumFeatures; i++)
     {
       if(pIIDs[i] == D3D12ExperimentalShaderModels)
         allowedIIDs.push_back(D3D12ExperimentalShaderModels);
+      else if(pIIDs[i] == D3D12GPUUploadHeapsOnUnsupportedOS)
+        allowedIIDs.push_back(D3D12GPUUploadHeapsOnUnsupportedOS);
     }
 
     // there's no "partially successful" error code, so we just lie to the application and pretend
@@ -723,7 +725,7 @@ private:
        riid != __uuidof(ID3D12Device8) && riid != __uuidof(ID3D12Device9) &&
        riid != __uuidof(ID3D12Device10) && riid != __uuidof(ID3D12Device11) &&
        riid != __uuidof(ID3D12Device12) && riid != __uuidof(ID3D12Device13) &&
-       riid != __uuidof(ID3D12Device14))
+       riid != __uuidof(ID3D12Device14) && riid != __uuidof(ID3D12Device15))
     {
       RDCERR("Unsupported UUID %s for D3D12CreateDevice", ToStr(riid).c_str());
       return E_NOINTERFACE;
@@ -826,6 +828,11 @@ private:
           ID3D12Device14 *dev14 = (ID3D12Device14 *)*ppDevice;
           dev = (ID3D12Device *)dev14;
         }
+        else if(riid == __uuidof(ID3D12Device15))
+        {
+          ID3D12Device15 *dev15 = (ID3D12Device15 *)*ppDevice;
+          dev = (ID3D12Device *)dev15;
+        }
 
         WrappedID3D12Device *wrap = WrappedID3D12Device::Create(dev, params, EnableDebugLayer);
 
@@ -867,6 +874,8 @@ private:
           *ppDevice = (ID3D12Device13 *)wrap;
         else if(riid == __uuidof(ID3D12Device14))
           *ppDevice = (ID3D12Device14 *)wrap;
+        else if(riid == __uuidof(ID3D12Device15))
+          *ppDevice = (ID3D12Device15 *)wrap;
       }
     }
     else if(SUCCEEDED(ret))
@@ -913,11 +922,13 @@ private:
   {
     rdcarray<IID> allowedIIDs;
 
-    // allow enabling unsigned DXIL.
+    // allow enabling unsigned DXIL, and GPU upload heaps on most windows versions
     for(UINT i = 0; i < NumFeatures; i++)
     {
       if(pIIDs[i] == D3D12ExperimentalShaderModels)
         allowedIIDs.push_back(D3D12ExperimentalShaderModels);
+      else if(pIIDs[i] == D3D12GPUUploadHeapsOnUnsupportedOS)
+        allowedIIDs.push_back(D3D12GPUUploadHeapsOnUnsupportedOS);
     }
 
     // there's no "partially successful" error code, so we just lie to the application and pretend
@@ -942,6 +953,12 @@ private:
 
   static HRESULT WINAPI D3D12GetDebugInterface_hook(REFIID riid, void **ppvDebug)
   {
+    if(riid == CLSID_D3D12StateObjectFactory)
+    {
+      RDCLOG("Deliberately reporting no support for state object factories");
+      return E_NOINTERFACE;
+    }
+
     IUnknown *realUnk = NULL;
     HRESULT real = d3d12hooks.GetDebugInterface()(riid, (void **)&realUnk);
 
@@ -961,6 +978,12 @@ private:
 
   static HRESULT WINAPI D3D12GetInterface_hook(REFCLSID rclsid, REFIID riid, void **ppvDebug)
   {
+    if(riid == CLSID_D3D12StateObjectFactory)
+    {
+      RDCLOG("Deliberately reporting no support for state object factories");
+      return E_NOINTERFACE;
+    }
+
     IUnknown *realUnk = NULL;
     HRESULT real = d3d12hooks.GetInterface()(rclsid, riid, (void **)&realUnk);
 

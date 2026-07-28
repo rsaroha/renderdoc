@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2025 Baldur Karlsson
+ * Copyright (c) 2019-2026 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -603,7 +603,41 @@ enum class DXOp : uint32_t
   SampleCmpBias = 255,
   StartVertexLocation = 256,
   StartInstanceLocation = 257,
-  NumOpCodes = 258,
+  AllocateRayQuery2 = 258,
+  HitObject_TraceRay = 262,
+  HitObject_FromRayQuery = 263,
+  HitObject_FromRayQueryWithAttrs = 264,
+  HitObject_MakeMiss = 265,
+  HitObject_MakeNop = 266,
+  HitObject_Invoke = 267,
+  MaybeReorderThread = 268,
+  HitObject_IsMiss = 269,
+  HitObject_IsHit = 270,
+  HitObject_IsNop = 271,
+  HitObject_RayFlags = 272,
+  HitObject_RayTMin = 273,
+  HitObject_RayTCurrent = 274,
+  HitObject_WorldRayOrigin = 275,
+  HitObject_WorldRayDirection = 276,
+  HitObject_ObjectRayOrigin = 277,
+  HitObject_ObjectRayDirection = 278,
+  HitObject_ObjectToWorld3x4 = 279,
+  HitObject_WorldToObject3x4 = 280,
+  HitObject_GeometryIndex = 281,
+  HitObject_InstanceIndex = 282,
+  HitObject_InstanceID = 283,
+  HitObject_PrimitiveIndex = 284,
+  HitObject_HitKind = 285,
+  HitObject_ShaderTableIndex = 286,
+  HitObject_SetShaderTableIndex = 287,
+  HitObject_LoadLocalRootTableConstant = 288,
+  HitObject_Attributes = 289,
+  RawBufferVectorLoad = 303,
+  RawBufferVectorStore = 304,
+  VectorReduceAnd = 309,
+  VectorReduceOr = 310,
+  FDot = 311,
+  NumOpCodes,
 };
 
 enum class AtomicBinOpCode : uint32_t
@@ -909,7 +943,7 @@ struct ValueList : private rdcarray<Value *>
   T *nextValue()
   {
     RDCASSERT(!pendingValue);
-    RDCCOMPILE_ASSERT(typename T::IsForwardReferenceable,
+    RDCCOMPILE_ASSERT(T::IsForwardReferenceable,
                       "alloc'ing next value for non-forward-referenceable type");
 
     pendingValue = true;
@@ -1617,9 +1651,9 @@ struct ResourceReference
 {
   ResourceReference(const rdcstr &handleStr, const EntryPointInterface::ResourceBase &resBase,
                     uint32_t idx)
-      : handleID(handleStr), resourceBase(resBase), resourceIndex(idx){};
+      : handleString(handleStr), resourceBase(resBase), resourceIndex(idx){};
 
-  rdcstr handleID;
+  rdcstr handleString;
   EntryPointInterface::ResourceBase resourceBase;
   uint32_t resourceIndex;
 };
@@ -1727,12 +1761,12 @@ protected:
   void AssignMetaSlot(rdcarray<Metadata *> &metaSlots, uint32_t &nextMetaSlot, DebugLocation &l);
 
   const ResourceReference *GetResourceReference(const DXILDebug::Id handleId) const;
-  rdcstr GetHandleAlias(const rdcstr &handleStr) const;
   static DXILDebug::Id GetResultSSAId(const DXIL::Instruction &inst);
-  static void MakeResultId(const Instruction &inst, rdcstr &resultId);
-  rdcstr GetArgId(const Instruction &inst, uint32_t arg) const;
-  rdcstr GetArgId(const Value *v) const;
-  rdcstr GetArgumentName(const Value *v) const;
+  rdcstr GetInstResultName(const DXIL::Instruction *inst) const;
+  void GetSSAName(DXILDebug::Id id, rdcstr &name) const;
+  void SetSSAName(DXILDebug::Id id, const rdcstr &name, bool overwrite = false);
+  rdcstr GetArgString(const Instruction &inst, uint32_t arg) const;
+  rdcstr GetValueString(const Value *v) const;
 
   const Metadata *FindMetadata(uint32_t slot) const;
   rdcstr ArgToString(const Value *v, bool withTypes, const rdcstr &attrString = "") const;
@@ -1805,9 +1839,9 @@ protected:
 
   rdcarray<EntryPointInterface> m_EntryPointInterfaces;
   std::map<DXILDebug::Id, size_t> m_ResourceByIdHandles;
-  std::map<rdcstr, rdcstr> m_SsaAliases;
-  std::map<rdcstr, uint32_t> m_ResourceAnnotateCounts;
   rdcarray<LocalSourceVariable> m_Locals;
+  std::map<DXILDebug::Id, rdcstr> m_SsaNames;
+  std::map<DXILDebug::Id, rdcstr> m_SsaHandles;
 
   rdcarray<ResourceReference> m_ResourceReferences;
   rdcstr m_Disassembly;
@@ -1848,10 +1882,6 @@ bool IsLLVMIntrinsicCall(const Instruction &inst);
 bool ShouldIgnoreSourceMapping(const Instruction &inst);
 
 bool isUndef(const Value *v);
-
-void SanitiseName(rdcstr &name);
-rdcstr GetGlobalVarName(const GlobalVar *gv);
-
 };    // namespace DXIL
 
 DECLARE_REFLECTION_ENUM(DXIL::Attribute);

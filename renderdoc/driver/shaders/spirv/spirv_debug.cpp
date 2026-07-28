@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2020-2025 Baldur Karlsson
+ * Copyright (c) 2020-2026 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -36,7 +36,7 @@
 
 using namespace rdcshaders;
 
-#if defined(RELEASE)
+#if ENABLED(RDOC_RELEASE)
 #define CHECK_DEBUGGER_THREAD() \
   do                            \
   {                             \
@@ -44,7 +44,7 @@ using namespace rdcshaders;
 #else
 #define CHECK_DEBUGGER_THREAD() \
   RDCASSERTMSG("Function called from non-debugger thread!", debugger.IsDeviceThread());
-#endif    // #if defined(RELEASE)
+#endif    // #if ENABLED(RDOC_RELEASE)
 
 static bool ContainsNaNInf(const ShaderVariable &var)
 {
@@ -174,9 +174,14 @@ static ShaderVariable MakeIdentity(const rdcspv::DataType &type, float val, bool
 
 namespace rdcspv
 {
-ThreadState::ThreadState(Debugger &debug, const GlobalState &globalState)
-    : debugger(debug), global(globalState)
+ThreadState::ThreadState(Debugger &debug, const GlobalState &globalState, ShaderStage stage,
+                         ShaderFeatures shaderFeatures)
+    : debugger(debug), global(globalState), features(shaderFeatures)
 {
+  // Default to Coarse, choose Fine for compute shaders
+  defaultDeriveType = DerivType::Coarse;
+  if(stage == ShaderStage::Compute)
+    defaultDeriveType = DerivType::Fine;
 }
 
 ThreadState::~ThreadState()
@@ -387,6 +392,10 @@ DeviceOpResult ThreadState::WritePointerValue(Id pointer, const ShaderVariable &
     if(opResult == DeviceOpResult::NeedsDevice)
       return DeviceOpResult::NeedsDevice;
 
+    // Mark the pointer as being live
+    bool wasLive = SetLive(pointer);
+    bool baseWasLive = (pointer == ptrid) ? wasLive : live.contains(ptrid);
+
     rdcarray<ShaderVariableChange> changes;
     rdcarray<Id> &pointers = pointersForId[ptrid];
 
@@ -429,12 +438,14 @@ DeviceOpResult ThreadState::WritePointerValue(Id pointer, const ShaderVariable &
     // it's a no-op change
     int ptrIdx = pointers.indexOf(pointer);
 
+    bool aliasChangeAdded = false;
     if(ptrIdx >= 0)
     {
       if(pointer != ptrid)
       {
         pendingDebugState.changes.push_back(changes[ptrIdx]);
         changes.erase(ptrIdx);
+        aliasChangeAdded = true;
       }
     }
 
@@ -450,12 +461,56 @@ DeviceOpResult ThreadState::WritePointerValue(Id pointer, const ShaderVariable &
     opResult = debugger.GetPointerValue(ids[ptrid], basechange.after);
     SPIRV_DEBUG_RDCASSERTEQUAL(opResult, DeviceOpResult::Succeeded);
 
-    // if this is the first local write, mark this variable as becoming alive here, instead of at
-    // its declaration
-    if(firstLocalWrite)
-      basechange.before = {};
+    bool includeBaseChange = false;
 
-    pendingDebugState.changes.push_back(basechange);
+    // Generate a change for the base pointer if it is live in this scope
+    if(!includeBaseChange && live.contains(ptrid))
+      includeBaseChange = true;
+
+    // Generate a change for the base pointer if it is not live in any outer scopes
+    if(!includeBaseChange)
+    {
+      bool foundIt = false;
+      for(size_t i = 0; i < callstack.size() - 1; ++i)
+      {
+        foundIt = callstack[i]->live.contains(ptrid);
+        if(foundIt)
+          break;
+      }
+      if(!foundIt)
+      {
+        includeBaseChange = true;
+        baseWasLive = false;
+      }
+    }
+
+    // This should not happen
+    if(!includeBaseChange && !aliasChangeAdded)
+    {
+      RDCWARN("Base pointer is not live and no aliased pointer detected, adding base change");
+      includeBaseChange = true;
+    }
+
+    // there should always be a change writing direct to the base pointer
+    if(!includeBaseChange && (pointer == ptrid))
+    {
+      RDCWARN("Base pointer is not live and writing direct to pointer, adding base change");
+      includeBaseChange = true;
+    }
+
+    if(includeBaseChange)
+    {
+      // mark this variable as becoming alive here,
+      // if this is the first local write (instead of at its declaration)
+      if(firstLocalWrite)
+        basechange.before = {};
+
+      if(!baseWasLive)
+        basechange.before = {};
+
+      pendingDebugState.changes.push_back(basechange);
+      SetLive(ptrid);
+    }
 
     if(ptrIdx == -1)
       pointers.push_back(pointer);
@@ -487,6 +542,19 @@ void ThreadState::DebugBreak()
 {
   if(hasDebugState)
     pendingDebugState.flags |= ShaderEvents::DebugBreak;
+}
+
+bool ThreadState::SetLive(Id id)
+{
+  bool wasLive = false;
+  if(hasDebugState)
+  {
+    auto it = std::lower_bound(live.begin(), live.end(), id);
+    wasLive = (it != live.end() && *it == id);
+    if(!wasLive)
+      live.insert(it - live.begin(), id);
+  }
+  return wasLive;
 }
 
 void ThreadState::SetDst(Id id, const ShaderVariable &val)
@@ -525,14 +593,7 @@ void ThreadState::SetDst(Id id, const ShaderVariable &val)
 
   lastWrite[id] = hasDebugState ? stepIndex : nextInstruction;
 
-  bool wasLive = false;
-  if(hasDebugState)
-  {
-    auto it = std::lower_bound(live.begin(), live.end(), id);
-    wasLive = (it != live.end() && *it == id);
-    if(!wasLive)
-      live.insert(it - live.begin(), id);
-  }
+  bool wasLive = SetLive(id);
 
   if(val.type == VarType::GPUPointer && !debugger.IsPhysicalPointer(val))
   {
@@ -577,6 +638,8 @@ void ThreadState::ProcessScopeChange(const rdcarray<Id> &oldLive, const rdcarray
   {
     if(liveGlobals.contains(id))
       continue;
+    if(newLive.contains(id))
+      continue;
 
     DeviceOpResult opResult = debugger.GetPointerValue(ids[id], val);
     SPIRV_DEBUG_RDCASSERTEQUAL(opResult, DeviceOpResult::Succeeded);
@@ -594,6 +657,8 @@ void ThreadState::ProcessScopeChange(const rdcarray<Id> &oldLive, const rdcarray
   for(const Id &id : newLive)
   {
     if(liveGlobals.contains(id))
+      continue;
+    if(oldLive.contains(id))
       continue;
 
     DeviceOpResult opResult = debugger.GetPointerValue(ids[id], val);
@@ -616,6 +681,14 @@ ShaderVariable ThreadState::CalcDeriv(ThreadState::DerivDir dir, ThreadState::De
                                                debugger.GetHumanName(val).c_str()));
     return ShaderVariable("", 0.0f, 0.0f, 0.0f, 0.0f);
   }
+  if(!(features & ShaderFeatures::Derivatives))
+  {
+    debugger.AddDebugMessage(
+        MessageCategory::Execution, MessageSeverity::High, MessageSource::RuntimeWarning,
+        StringFormat::Fmt("Derivative calculation within shader without support for derivatives %s",
+                          debugger.GetHumanName(val).c_str()));
+    return ShaderVariable("", 0.0f, 0.0f, 0.0f, 0.0f);
+  }
 
   RDCASSERT(quadNeighbours[0] < workgroup.size(), quadNeighbours[0], workgroup.size());
   RDCASSERT(quadNeighbours[1] < workgroup.size(), quadNeighbours[1], workgroup.size());
@@ -623,7 +696,7 @@ ShaderVariable ThreadState::CalcDeriv(ThreadState::DerivDir dir, ThreadState::De
   RDCASSERT(quadNeighbours[3] < workgroup.size(), quadNeighbours[3], workgroup.size());
 
   const bool xdirection = (dir == DDX);
-  if(type == Coarse)
+  if(type == DerivType::Coarse)
   {
     // coarse derivatives are identical across the quad, based on the top-left.
     a = &workgroup[quadNeighbours[0]];
@@ -1064,7 +1137,7 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
 
       // Result Type must be an OpTypeInt with 32-bit Width and 0 Signedness
       result.type = VarType::UInt;
-      setUintComp(result, 0, uint32_t(byteLen));
+      setUint64Comp(result, 0, byteLen);
 
       SetDst(len.result, result);
 
@@ -1120,6 +1193,7 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
     // spec allows the implementation to choose what DPdx means (coarse or fine), so we choose
     // coarse which seems a reasonable default. In future we could driver-detect the selection in
     // use (assuming it's not dynamic base on circumstances)
+    // Compute shaders use Fine by default
     case Op::DPdx:
     case Op::DPdy:
     case Op::DPdxCoarse:
@@ -1134,9 +1208,11 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
       if(opdata.op == Op::DPdy || opdata.op == Op::DPdyCoarse || opdata.op == Op::DPdyFine)
         dir = DDY;
 
-      DerivType type = Coarse;
+      DerivType type = defaultDeriveType;
       if(opdata.op == Op::DPdxFine || opdata.op == Op::DPdyFine)
-        type = Fine;
+        type = DerivType::Fine;
+      if(opdata.op == Op::DPdxCoarse || opdata.op == Op::DPdyCoarse)
+        type = DerivType::Coarse;
 
       SetDst(deriv.result, CalcDeriv(dir, type, workgroup, deriv.p));
 
@@ -1149,9 +1225,9 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
       // these all share a format
       OpFwidth deriv(it);
 
-      DerivType type = Coarse;
+      DerivType type = DerivType::Coarse;
       if(opdata.op == Op::FwidthFine)
-        type = Fine;
+        type = DerivType::Fine;
 
       ShaderVariable var = CalcDeriv(DDX, type, workgroup, deriv.p);
       ShaderVariable ddy = CalcDeriv(DDY, type, workgroup, deriv.p);
@@ -2158,17 +2234,21 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
       for(uint8_t c = 0; c < var.columns; c++)
       {
 #undef _IMPL
-#define _IMPL(I, S, U)                               \
-  const U mask = (U(1) << comp<U>(count, c)) - U(1); \
-                                                     \
-  comp<U>(var, c) >>= comp<U>(offset, c);            \
-  comp<U>(var, c) &= mask;                           \
-                                                     \
-  if(opdata.op == Op::BitFieldSExtract)              \
-  {                                                  \
-    U topbit = (mask + U(1)) >> U(1);                \
-    if(comp<U>(var, c) & topbit)                     \
-      comp<U>(var, c) |= (~0ULL ^ mask);             \
+#define _IMPL(I, S, U)                        \
+  const U bitcount = comp<U>(count, c);       \
+  if(bitcount < sizeof(U) * 8)                \
+  {                                           \
+    const U mask = (U(1) << bitcount) - U(1); \
+                                              \
+    comp<U>(var, c) >>= comp<U>(offset, c);   \
+    comp<U>(var, c) &= mask;                  \
+                                              \
+    if(opdata.op == Op::BitFieldSExtract)     \
+    {                                         \
+      U topbit = (mask + U(1)) >> U(1);       \
+      if(comp<U>(var, c) & topbit)            \
+        comp<U>(var, c) |= (~0ULL ^ mask);    \
+    }                                         \
   }
 
         IMPL_FOR_INT_TYPES(_IMPL);
@@ -2858,6 +2938,34 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
       break;
     }
 
+    case Op::FmaKHR:
+    {
+      OpFmaKHR fma(it);
+
+      const DataType &resultType = debugger.GetType(fma.resultType);
+
+      if(IsPendingResultReady())
+      {
+        ShaderVariable result = GetPendingResult();
+        result.rows = 1;
+        result.columns = RDCMAX(1U, resultType.vector().count) & 0xff;
+
+        SetDst(fma.result, result);
+        break;
+      }
+
+      rdcarray<ShaderVariable> paramVars;
+      paramVars.push_back(GetSrc(fma.operand1));
+      paramVars.push_back(GetSrc(fma.operand2));
+      paramVars.push_back(GetSrc(fma.operand3));
+
+      ShaderVariable ret = paramVars[0];
+
+      QueueMathOp(Op::FmaKHR, GLSLstd450::Invalid, paramVars, ret);
+
+      break;
+    }
+
       //////////////////////////////////////////////////////////////////////////////
       //
       // Subgroup opcodes
@@ -3022,7 +3130,7 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
         OpGroupNonUniformBroadcast group(it);
         RDCASSERT(uintComp(GetSrc(group.execution), 0) == (uint32_t)Scope::Subgroup);
         value = group.value;
-        lane = firstLaneInSub + uintComp(GetSrc(group.id), 0);
+        lane = firstLaneInSub + uintComp(GetSrc(group.invocationId), 0);
       }
       else if(opdata.op == Op::GroupNonUniformQuadBroadcast)
       {
@@ -3086,7 +3194,7 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
         OpGroupNonUniformShuffle group(it);
         RDCASSERT(uintComp(GetSrc(group.execution), 0) == (uint32_t)Scope::Subgroup);
         value = group.value;
-        lane = firstLaneInSub + uintComp(GetSrc(group.id), 0);
+        lane = firstLaneInSub + uintComp(GetSrc(group.invocationId), 0);
       }
       else if(opdata.op == Op::GroupNonUniformShuffleXor ||
               opdata.op == Op::GroupNonUniformShuffleUp ||
@@ -3844,8 +3952,8 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
       if(derivId != Id())
       {
         // calculate DDX/DDY in coarse fashion
-        ddxCalc = CalcDeriv(DDX, Coarse, workgroup, derivId);
-        ddyCalc = CalcDeriv(DDY, Coarse, workgroup, derivId);
+        ddxCalc = CalcDeriv(DDX, DerivType::Coarse, workgroup, derivId);
+        ddyCalc = CalcDeriv(DDY, DerivType::Coarse, workgroup, derivId);
       }
 
       // if we have a dynamically combined image sampler, split it up here
@@ -3923,7 +4031,7 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
 
         QueueSampleGather(Op::ImageFetch, texType, img.GetBindIndex(), ShaderBindIndex(), coord,
                           ShaderVariable(), ShaderVariable(), ShaderVariable(), GatherChannel::Red,
-                          ImageOperandsAndParamDatas(), result);
+                          read.imageOperands, result);
       }
       else
       {
@@ -4187,6 +4295,24 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
     case Op::TerminateInvocation:
     case Op::Kill:
     {
+      dead = true;
+
+      // destroy all stack frames
+      for(StackFrame *exitingFrame : callstack)
+        delete exitingFrame;
+
+      callstack.clear();
+
+      break;
+    }
+    case Op::AbortKHR:
+    {
+      // if this actually ran it would have taken down the whole device and we wouldn't be shader
+      // debugging, so we should not hit this.
+      RDCERR(
+          "Op::Abort reached, this should not happen and indicates the shader has diverged from "
+          "GPU execution");
+      DebugBreak();
       dead = true;
 
       // destroy all stack frames
@@ -4806,6 +4932,225 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
     case Op::SDotAccSat:
     case Op::UDotAccSat:
     case Op::SUDotAccSat:
+    {
+      Id vector1;
+      Id vector2;
+      Id result;
+      ShaderVariable acc;
+      bool leftSigned = true;
+      bool rightSigned = true;
+      PackedVectorFormat packedFormat = PackedVectorFormat::Invalid;
+      bool hasPackedFormat = false;
+      switch(opdata.op)
+      {
+        case Op::SDot:
+        {
+          OpSDot dot(it);
+          vector1 = dot.vector1;
+          vector2 = dot.vector2;
+          result = dot.result;
+          packedFormat = dot.packedVectorFormat;
+          hasPackedFormat = dot.HasPackedVectorFormat();
+          break;
+        }
+        case Op::SDotAccSat:
+        {
+          OpSDotAccSat dot(it);
+          vector1 = dot.vector1;
+          vector2 = dot.vector2;
+          acc = GetSrc(dot.accumulator);
+          result = dot.result;
+          packedFormat = dot.packedVectorFormat;
+          hasPackedFormat = dot.HasPackedVectorFormat();
+          break;
+        }
+        case Op::UDot:
+        {
+          OpUDot dot(it);
+          vector1 = dot.vector1;
+          vector2 = dot.vector2;
+          result = dot.result;
+          leftSigned = false;
+          rightSigned = false;
+          packedFormat = dot.packedVectorFormat;
+          hasPackedFormat = dot.HasPackedVectorFormat();
+          break;
+        }
+        case Op::UDotAccSat:
+        {
+          OpUDotAccSat dot(it);
+          vector1 = dot.vector1;
+          vector2 = dot.vector2;
+          acc = GetSrc(dot.accumulator);
+          result = dot.result;
+          leftSigned = false;
+          rightSigned = false;
+          packedFormat = dot.packedVectorFormat;
+          hasPackedFormat = dot.HasPackedVectorFormat();
+          break;
+        }
+        case Op::SUDot:
+        {
+          OpSUDot dot(it);
+          vector1 = dot.vector1;
+          vector2 = dot.vector2;
+          result = dot.result;
+          rightSigned = false;
+          packedFormat = dot.packedVectorFormat;
+          hasPackedFormat = dot.HasPackedVectorFormat();
+          break;
+        }
+        case Op::SUDotAccSat:
+        {
+          OpSUDotAccSat dot(it);
+          vector1 = dot.vector1;
+          vector2 = dot.vector2;
+          acc = GetSrc(dot.accumulator);
+          result = dot.result;
+          rightSigned = false;
+          packedFormat = dot.packedVectorFormat;
+          hasPackedFormat = dot.HasPackedVectorFormat();
+          break;
+        }
+        default: RDCERR("Unexpected opcode %s", ToStr(opdata.op).c_str()); break;
+      }
+
+      ShaderVariable lhs = GetSrc(vector1);
+      ShaderVariable rhs = GetSrc(vector2);
+
+      RDCASSERTEQUAL(lhs.columns, rhs.columns);
+      // 1x32-bit is a 4x-8bit packed vector
+      if((lhs.columns == 1) && (lhs.type == VarType::SInt || lhs.type == VarType::UInt))
+      {
+        lhs.columns = 4;
+        rhs.columns = 4;
+        lhs.type = (lhs.type == VarType::SInt) ? VarType::SByte : VarType::UByte;
+        rhs.type = (rhs.type == VarType::SInt) ? VarType::SByte : VarType::UByte;
+        if(!hasPackedFormat)
+        {
+          RDCERR("Inputs are packed but opcode does not specify packed format opcode %s",
+                 ToStr(opdata.op).c_str());
+          break;
+        }
+        if(packedFormat != PackedVectorFormat::PackedVectorFormat4x8Bit)
+        {
+          RDCERR("Inputs are packed but opcdode specifies an invalid packed format %u opcode %s",
+                 (uint32_t)packedFormat, ToStr(opdata.op).c_str());
+          break;
+        }
+      }
+      else
+      {
+        if(hasPackedFormat)
+        {
+          RDCERR("Inputs are not packed but opcode does specify packed format opcode %s",
+                 ToStr(opdata.op).c_str());
+          break;
+        }
+      }
+      const DataType &resultType = debugger.GetType(opdata.resultType);
+      ShaderVariable var;
+      var.type = resultType.scalar().Type();
+      var.rows = 1;
+      var.columns = 1;
+      int64_t sMinValue = int64_t(INT64_MIN);
+      int64_t sMaxValue = int64_t(INT64_MAX);
+      if(var.type == VarType::SInt)
+      {
+        sMinValue = int64_t(INT32_MIN);
+        sMaxValue = int64_t(INT32_MAX);
+      }
+      else if(var.type == VarType::SShort)
+      {
+        sMinValue = int64_t(INT16_MIN);
+        sMaxValue = int64_t(INT16_MAX);
+      }
+      else if(var.type == VarType::SByte)
+      {
+        sMinValue = int64_t(INT8_MIN);
+        sMaxValue = int64_t(INT8_MAX);
+      }
+      uint64_t uMaxValue = uint64_t(UINT64_MAX);
+      if(var.type == VarType::UInt)
+      {
+        uMaxValue = uint64_t(UINT32_MAX);
+      }
+      else if(var.type == VarType::UShort)
+      {
+        uMaxValue = uint64_t(UINT16_MAX);
+      }
+      else if(var.type == VarType::UByte)
+      {
+        uMaxValue = uint64_t(UINT8_MAX);
+      }
+
+      if(leftSigned && rightSigned)
+      {
+#undef _IMPL
+#define _IMPL(I, S, U)                                  \
+  int64_t ret(0);                                       \
+  if(!hasPackedFormat)                                  \
+  {                                                     \
+    for(uint8_t c = 0; c < lhs.columns; c++)            \
+      ret += comp<S>(lhs, c) * comp<S>(rhs, c);         \
+  }                                                     \
+  else                                                  \
+  {                                                     \
+    for(uint8_t c = 0; c < lhs.columns; c++)            \
+      ret += (S)lhs.value.s8v[c] * (S)rhs.value.s8v[c]; \
+  }                                                     \
+  ret += comp<S>(acc, 0);                               \
+  ret = RDCCLAMP(ret, sMinValue, sMaxValue);            \
+  comp<S>(var, 0) = (S)ret;
+
+        IMPL_FOR_INT_TYPES(_IMPL);
+      }
+      else if(!leftSigned && !rightSigned)
+      {
+#undef _IMPL
+#define _IMPL(I, S, U)                                  \
+  uint64_t ret(0);                                      \
+  if(!hasPackedFormat)                                  \
+  {                                                     \
+    for(uint8_t c = 0; c < lhs.columns; c++)            \
+      ret += comp<U>(lhs, c) * comp<U>(rhs, c);         \
+  }                                                     \
+  else                                                  \
+  {                                                     \
+    for(uint8_t c = 0; c < lhs.columns; c++)            \
+      ret += (U)lhs.value.u8v[c] * (U)rhs.value.u8v[c]; \
+  }                                                     \
+  ret += comp<U>(acc, 0);                               \
+  ret = RDCMIN(ret, uMaxValue);                         \
+  comp<U>(var, 0) = (U)ret;
+
+        IMPL_FOR_INT_TYPES(_IMPL);
+      }
+      else if(leftSigned && !rightSigned)
+      {
+#undef _IMPL
+#define _IMPL(I, S, U)                                  \
+  int64_t ret(0);                                       \
+  if(!hasPackedFormat)                                  \
+  {                                                     \
+    for(uint8_t c = 0; c < lhs.columns; c++)            \
+      ret += comp<S>(lhs, c) * comp<U>(rhs, c);         \
+  }                                                     \
+  else                                                  \
+  {                                                     \
+    for(uint8_t c = 0; c < lhs.columns; c++)            \
+      ret += (S)lhs.value.s8v[c] * (U)rhs.value.u8v[c]; \
+  }                                                     \
+  ret += comp<S>(acc, 0);                               \
+  ret = RDCCLAMP(ret, sMinValue, sMaxValue);            \
+  comp<S>(var, 0) = (S)ret;
+
+        IMPL_FOR_INT_TYPES(_IMPL);
+      }
+
+      SetDst(result, var);
+      break;
+    }
 
       // legacy/OpenCL/AMD group operations
     case Op::GroupAll:
@@ -4880,7 +5225,7 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
     case Op::FragmentMaskFetchAMD:
     case Op::FragmentFetchAMD:
     case Op::ImageSampleFootprintNV:
-    case Op::GroupNonUniformPartitionNV:
+    case Op::GroupNonUniformPartitionEXT:
     case Op::WritePackedPrimitiveIndices4x8NV:
     case Op::ReportIntersectionKHR:
     case Op::IgnoreIntersectionNV:
@@ -4995,7 +5340,6 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
     case Op::HitObjectIsMissNV:
     case Op::ReorderThreadWithHitObjectNV:
     case Op::ReorderThreadWithHintNV:
-    case Op::TypeHitObjectNV:
     case Op::ColorAttachmentReadEXT:
     case Op::DepthAttachmentReadEXT:
     case Op::StencilAttachmentReadEXT:
@@ -5006,7 +5350,6 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
     case Op::RayQueryGetIntersectionTriangleVertexPositionsKHR:
     case Op::ConvertBF16ToFINTEL:
     case Op::ConvertFToBF16INTEL:
-    case Op::TypeCooperativeMatrixKHR:
     case Op::CooperativeMatrixLoadKHR:
     case Op::CooperativeMatrixStoreKHR:
     case Op::CooperativeMatrixMulAddKHR:
@@ -5027,6 +5370,109 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
     case Op::ConstantCompositeReplicateEXT:
     case Op::SpecConstantCompositeReplicateEXT:
     case Op::RawAccessChainNV:
+    case Op::CreateTensorLayoutNV:
+    case Op::CreateTensorViewNV:
+    case Op::TensorViewSetClipNV:
+    case Op::TensorViewSetDimensionNV:
+    case Op::TensorViewSetStrideNV:
+    case Op::TensorLayoutSetDimensionNV:
+    case Op::TensorLayoutSetBlockSizeNV:
+    case Op::TensorLayoutSetClampValueNV:
+    case Op::TensorLayoutSetStrideNV:
+    case Op::TensorLayoutSliceNV:
+    case Op::RayQueryGetIntersectionClusterIdNV:
+    case Op::RayQueryIsSphereHitNV:
+    case Op::RayQueryIsLSSHitNV:
+    case Op::RayQueryGetIntersectionLSSHitValueNV:
+    case Op::RayQueryGetIntersectionLSSPositionsNV:
+    case Op::RayQueryGetIntersectionLSSRadiiNV:
+    case Op::RayQueryGetIntersectionSpherePositionNV:
+    case Op::RayQueryGetIntersectionSphereRadiusNV:
+    case Op::HitObjectIsLSSHitNV:
+    case Op::HitObjectIsSphereHitNV:
+    case Op::HitObjectGetLSSPositionsNV:
+    case Op::HitObjectGetLSSRadiiNV:
+    case Op::HitObjectGetSpherePositionNV:
+    case Op::HitObjectGetSphereRadiusNV:
+    case Op::HitObjectGetClusterIdNV:
+    case Op::CooperativeMatrixConvertNV:
+    case Op::CooperativeMatrixReduceNV:
+    case Op::CooperativeMatrixLoadTensorNV:
+    case Op::CooperativeMatrixStoreTensorNV:
+    case Op::CooperativeMatrixPerElementOpNV:
+    case Op::CooperativeMatrixTransposeNV:
+    case Op::CooperativeVectorLoadNV:
+    case Op::CooperativeVectorStoreNV:
+    case Op::CooperativeVectorMatrixMulAddNV:
+    case Op::CooperativeVectorMatrixMulNV:
+    case Op::CooperativeVectorOuterProductAccumulateNV:
+    case Op::CooperativeVectorReduceSumAccumulateNV:
+    case Op::GraphARM:
+    case Op::GraphConstantARM:
+    case Op::GraphEntryPointARM:
+    case Op::GraphInputARM:
+    case Op::GraphSetOutputARM:
+    case Op::GraphEndARM:
+    case Op::ArithmeticFenceEXT:
+    case Op::EnqueueNodePayloadsAMDX:
+    case Op::IsNodePayloadValidAMDX:
+    case Op::UntypedGroupAsyncCopyKHR:
+    case Op::UntypedVariableKHR:
+    case Op::UntypedAccessChainKHR:
+    case Op::UntypedInBoundsAccessChainKHR:
+    case Op::UntypedInBoundsPtrAccessChainKHR:
+    case Op::UntypedPtrAccessChainKHR:
+    case Op::UntypedArrayLengthKHR:
+    case Op::UntypedPrefetchKHR:
+    case Op::BitCastArrayQCOM:
+    case Op::CompositeConstructCoopMatQCOM:
+    case Op::CompositeExtractCoopMatQCOM:
+    case Op::ExtractSubArrayQCOM:
+    case Op::BufferPointerEXT:
+    case Op::UntypedImageTexelPointerEXT:
+    case Op::ConstantSizeOfEXT:
+    case Op::HitObjectRecordFromQueryEXT:
+    case Op::HitObjectRecordMissMotionEXT:
+    case Op::HitObjectGetIntersectionTriangleVertexPositionsEXT:
+    case Op::HitObjectGetRayFlagsEXT:
+    case Op::HitObjectSetShaderBindingTableRecordIndexEXT:
+    case Op::HitObjectReorderExecuteShaderEXT:
+    case Op::HitObjectTraceMotionReorderExecuteEXT:
+    case Op::ReorderThreadWithHintEXT:
+    case Op::ReorderThreadWithHitObjectEXT:
+    case Op::HitObjectTraceRayEXT:
+    case Op::HitObjectTraceRayMotionEXT:
+    case Op::HitObjectRecordEmptyEXT:
+    case Op::HitObjectExecuteShaderEXT:
+    case Op::HitObjectGetCurrentTimeEXT:
+    case Op::HitObjectRecordMissEXT:
+    case Op::HitObjectTraceReorderExecuteEXT:
+    case Op::HitObjectGetAttributesEXT:
+    case Op::HitObjectGetPrimitiveIndexEXT:
+    case Op::HitObjectGetGeometryIndexEXT:
+    case Op::HitObjectGetInstanceIdEXT:
+    case Op::HitObjectGetInstanceCustomIndexEXT:
+    case Op::HitObjectGetHitKindEXT:
+    case Op::HitObjectGetObjectRayOriginEXT:
+    case Op::HitObjectGetObjectRayDirectionEXT:
+    case Op::HitObjectGetWorldRayDirectionEXT:
+    case Op::HitObjectGetWorldRayOriginEXT:
+    case Op::HitObjectGetObjectToWorldEXT:
+    case Op::HitObjectGetWorldToObjectEXT:
+    case Op::HitObjectGetRayTMaxEXT:
+    case Op::HitObjectGetRayTMinEXT:
+    case Op::HitObjectGetShaderBindingTableRecordIndexEXT:
+    case Op::HitObjectGetShaderRecordBufferHandleEXT:
+    case Op::HitObjectIsEmptyEXT:
+    case Op::HitObjectIsHitEXT:
+    case Op::HitObjectIsMissEXT:
+    case Op::PoisonKHR:
+    case Op::FreezeKHR:
+    case Op::BitcastExtractEXT:
+    case Op::FDot2MixAcc16VALVE:
+    case Op::FDot2MixAcc32VALVE:
+    case Op::FDot4MixAcc32VALVE:
+    case Op::ImageGatherQCOM:
     {
       RDCERR("Unsupported extension opcode used %s", ToStr(opdata.op).c_str());
 
@@ -5093,19 +5539,20 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
     case Op::ModuleProcessed:
     case Op::ExecutionModeId:
     case Op::TypeUntypedPointerKHR:
-    case Op::UntypedVariableKHR:
-    case Op::UntypedAccessChainKHR:
-    case Op::UntypedInBoundsAccessChainKHR:
-    case Op::UntypedInBoundsPtrAccessChainKHR:
-    case Op::UntypedPtrAccessChainKHR:
-    case Op::UntypedArrayLengthKHR:
-    case Op::UntypedPrefetchKHR:
     case Op::TypeNodePayloadArrayAMDX:
     case Op::ConstantStringAMDX:
     case Op::SpecConstantStringAMDX:
-    case Op::TypeCooperativeVectorNV:
+    case Op::TypeVectorIdEXT:
     case Op::TypeTensorLayoutNV:
     case Op::TypeTensorViewNV:
+    case Op::TypeGraphARM:
+    case Op::TypeHitObjectNV:
+    case Op::TypeCooperativeMatrixKHR:
+    case Op::TypeBufferEXT:
+    case Op::MemberDecorateIdEXT:
+    case Op::TypeHitObjectEXT:
+    case Op::ConstantDataKHR:
+    case Op::SpecConstantDataKHR:
     {
       RDCERR("Encountered unexpected global SPIR-V operation %s", ToStr(opdata.op).c_str());
       break;
@@ -5171,69 +5618,37 @@ void ThreadState::StepNext(bool useDebugState, const uint32_t steps,
     case Op::TypePipeStorage:
     case Op::ConstantPipeStorage:
     case Op::CreatePipeFromPipeStorage:
-    case Op::FPGARegINTEL:
-    case Op::ReadPipeBlockingINTEL:
-    case Op::WritePipeBlockingINTEL:
-    case Op::ControlBarrierArriveINTEL:
-    case Op::ControlBarrierWaitINTEL:
-    case Op::ArithmeticFenceEXT:
+    case Op::ControlBarrierArriveEXT:
+    case Op::ControlBarrierWaitEXT:
     case Op::SubgroupMatrixMultiplyAccumulateINTEL:
-    case Op::EnqueueNodePayloadsAMDX:
-    case Op::IsNodePayloadValidAMDX:
     case Op::SubgroupBlockPrefetchINTEL:
     case Op::Subgroup2DBlockLoadINTEL:
     case Op::Subgroup2DBlockLoadTransformINTEL:
     case Op::Subgroup2DBlockLoadTransposeINTEL:
     case Op::Subgroup2DBlockPrefetchINTEL:
     case Op::Subgroup2DBlockStoreINTEL:
-    case Op::CreateTensorLayoutNV:
-    case Op::CreateTensorViewNV:
-    case Op::TensorViewSetClipNV:
-    case Op::TensorViewSetDimensionNV:
-    case Op::TensorViewSetStrideNV:
-    case Op::TensorLayoutSetDimensionNV:
-    case Op::TensorLayoutSetBlockSizeNV:
-    case Op::TensorLayoutSetClampValueNV:
-    case Op::TensorLayoutSetStrideNV:
-    case Op::TensorLayoutSliceNV:
-    case Op::RayQueryGetClusterIdNV:
-    case Op::RayQueryIsSphereHitNV:
-    case Op::RayQueryIsLSSHitNV:
-    case Op::RayQueryGetIntersectionLSSHitValueNV:
-    case Op::RayQueryGetIntersectionLSSPositionsNV:
-    case Op::RayQueryGetIntersectionLSSRadiiNV:
-    case Op::RayQueryGetIntersectionSpherePositionNV:
-    case Op::RayQueryGetIntersectionSphereRadiusNV:
-    case Op::HitObjectIsLSSHitNV:
-    case Op::HitObjectIsSphereHitNV:
-    case Op::HitObjectGetLSSPositionsNV:
-    case Op::HitObjectGetLSSRadiiNV:
-    case Op::HitObjectGetSpherePositionNV:
-    case Op::HitObjectGetSphereRadiusNV:
-    case Op::HitObjectGetClusterIdNV:
-    case Op::CooperativeMatrixConvertNV:
-    case Op::CooperativeMatrixReduceNV:
-    case Op::CooperativeMatrixLoadTensorNV:
-    case Op::CooperativeMatrixStoreTensorNV:
-    case Op::CooperativeMatrixPerElementOpNV:
-    case Op::CooperativeMatrixTransposeNV:
-    case Op::CooperativeVectorLoadNV:
-    case Op::CooperativeVectorStoreNV:
-    case Op::CooperativeVectorMatrixMulAddNV:
-    case Op::CooperativeVectorMatrixMulNV:
-    case Op::CooperativeVectorOuterProductAccumulateNV:
-    case Op::CooperativeVectorReduceSumAccumulateNV:
     case Op::TypeTensorARM:
     case Op::TensorReadARM:
     case Op::TensorWriteARM:
     case Op::TensorQuerySizeARM:
-    case Op::TaskSequenceAsyncINTEL:
-    case Op::TaskSequenceCreateINTEL:
-    case Op::TaskSequenceGetINTEL:
-    case Op::TaskSequenceReleaseINTEL:
-    case Op::TypeTaskSequenceINTEL:
     case Op::BitwiseFunctionINTEL:
     case Op::RoundFToTF32INTEL:
+    case Op::SaveMemoryINTEL:
+    case Op::RestoreMemoryINTEL:
+    case Op::VariableLengthArrayINTEL:
+    case Op::UntypedVariableLengthArrayINTEL:
+    case Op::ConditionalEntryPointINTEL:
+    case Op::ConditionalCapabilityINTEL:
+    case Op::ConditionalExtensionINTEL:
+    case Op::SpecConstantArchitectureINTEL:
+    case Op::SpecConstantTargetINTEL:
+    case Op::ConvertHandleToImageINTEL:
+    case Op::ConvertHandleToSampledImageINTEL:
+    case Op::ConvertHandleToSamplerINTEL:
+    case Op::SpecConstantCapabilitiesINTEL:
+    case Op::ConditionalCopyObjectINTEL:
+    case Op::PredicatedLoadINTEL:
+    case Op::PredicatedStoreINTEL:
     {
       // these are kernel only
       RDCERR("Encountered unexpected kernel SPIR-V operation %s", ToStr(opdata.op).c_str());
@@ -5341,13 +5756,14 @@ void ThreadState::ExecuteMemoryBarrier(Id semanticsId)
   }
 }
 
-void ThreadState::QueueMathOp(GLSLstd450 op, const rdcarray<ShaderVariable> &paramVars,
-                              const ShaderVariable &result)
+void ThreadState::QueueMathOp(Op opcode, GLSLstd450 glslop,
+                              const rdcarray<ShaderVariable> &paramVars, const ShaderVariable &result)
 {
   SPIRV_DEBUG_RDCASSERT(!IsPendingResultPending());
   pendingResultData = result;
   queuedGpuMathOp.workgroupIndex = workgroupIndex;
-  queuedGpuMathOp.op = op;
+  queuedGpuMathOp.opcode = opcode;
+  queuedGpuMathOp.glslop = glslop;
   queuedGpuMathOp.paramVars = paramVars;
   queuedGpuMathOp.result = &pendingResultData;
   SetStepNeedsGpuMathOp();

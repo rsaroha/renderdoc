@@ -1,6 +1,5 @@
 import os
 import traceback
-import copy
 import re
 import datetime
 import renderdoc as rd
@@ -407,7 +406,7 @@ class TestCase:
     def get_source_shader_var_value(self, sourceVars: List[rd.SourceVariableMapping], name, varType, debuggerVars):
         sourceVar = [v for v in sourceVars if v.name == name]
         if len(sourceVar) != 1:
-            raise TestFailureException(f"Couldn't find source variable {name} {varType}")
+            raise TestFailureException(f"Couldn't find source variable {name} type:{varType}")
 
         scalarType, countElems = self.parse_shader_var_type(varType)
 
@@ -417,7 +416,7 @@ class TestCase:
         elif scalarType == 'int':
             return list(debugged.value.s32v[0:countElems])
         else:
-            raise TestFailureException(f"Unhandled scalarType {scalarType} {varType}")
+            raise TestFailureException(f"Unhandled scalarType {scalarType} type:{varType}")
         return None
 
     def check_task_data(self, task_ref, task_data):
@@ -546,6 +545,9 @@ class TestCase:
 
         self.controller = analyse.open_capture(self.capture_filename, opts=self.get_replay_options())
         self.sdfile = self.controller.GetStructuredFile()
+
+        if not self.validate_eventids(self.controller):
+            raise TestFailureException("ERROR: capture doesn't have valid event IDs.")
 
         log.print("Checking capture")
 
@@ -817,18 +819,18 @@ class TestCase:
         remaining = ''
 
         # Otherwise, take off any child if we haven't started recursing
-        m = re.match("([a-zA-Z0-9_]+)(\[.*|\..*)", path)
+        m = re.match(r"([a-zA-Z0-9_]+)(\[.*|\..*)", path)
         if m:
             child = m.group(1)
             remaining = m.group(2)
         else:
             # array index
-            m = re.match("(\[[0-9]*\])(.*)", path)
+            m = re.match(r"(\[[0-9]*\])(.*)", path)
             if m:
                 child = m.group(1)
                 remaining = m.group(2)
             else:
-                m = re.match("\.([a-zA-Z0-9_]+)(.*)", path)
+                m = re.match(r"\.([a-zA-Z0-9_]+)(.*)", path)
                 if m:
                     child = m.group(1)
                     remaining = m.group(2)
@@ -1007,6 +1009,16 @@ class TestCase:
         for var in payload.variables:
             var_data = {}
             var_data[var.name] = []
+            if (var.type.baseType == rd.VarType.Struct):
+                structSize = 0
+                structSize += var.type.members[0].byteOffset
+                for member in var.type.members:
+                    byteWidth = rd.VarTypeByteSize(member.type.baseType)
+                    structSize += byteWidth * member.type.columns * member.type.elements
+                skipBytes = structSize * var.type.elements
+                log.print(f"Skipping struct variable '{var.name}' Size {skipBytes}")
+                offset += skipBytes
+                continue
             # This is not complete to decode all possible payload layouts
             for i in range(var.type.elements):
                 format = rd.ResourceFormat()
@@ -1016,7 +1028,8 @@ class TestCase:
                 format.type = rd.ResourceFormatType.Regular
 
                 data =  analyse.unpack_data(format, buffer_data, offset)
-                var_data[var.name] += data
+                if data:
+                    var_data[var.name] += data
                 offset += format.compByteWidth * format.compCount
             ret.append(var_data)
 
@@ -1089,6 +1102,12 @@ class TestCase:
         variables = {}
         for i in range(len(allChanges)):
             for c in allChanges[i]:
+                if len(c.after.name) == 0 and len(c.before.name) == 0:
+                    if c.before.type == rd.VarType.ReadOnlyResource or c.before.type == rd.VarType.ReadWriteResource:
+                        continue
+                    if c.after.type == rd.VarType.ReadOnlyResource or c.after.type == rd.VarType.ReadWriteResource:
+                        continue
+
                 if len(c.after.name) == 0:
                     if variables.get(c.before.name) is None:
                         raise TestFailureException(f"Step {i} ShaderVariableChange for '{c.before.name}' not found in existing variables")
@@ -1116,6 +1135,12 @@ class TestCase:
         # Step Backwards
         for i in reversed(range(len(allChanges))):
             for c in allChanges[i]:
+                if len(c.after.name) == 0 and len(c.before.name) == 0:
+                    if c.before.type == rd.VarType.ReadOnlyResource or c.before.type == rd.VarType.ReadWriteResource:
+                        continue
+                    if c.after.type == rd.VarType.ReadOnlyResource or c.after.type == rd.VarType.ReadWriteResource:
+                        continue
+
                 if len(c.before.name) == 0:
                     if variables.get(c.after.name) is None:
                         raise TestFailureException(f"Step {i} ShaderVariableChange for '{c.after.name}' not found in existing variables")
@@ -1140,4 +1165,53 @@ class TestCase:
                     if not self.validate_shadervariable(c.before):
                         raise TestFailureException(f"Step {i} ShaderVariableChange for '{c.after.name}' before is not well formed")
 
+        return True
+
+    def validate_eventids(self, controller: rd.ReplayController) -> bool:
+        actions = controller.GetRootActions().copy()
+        eventIds = set()
+        maxEventId = 0
+        while len(actions) > 0:
+            action = actions.pop()
+            for event in action.events:
+                eid = event.eventId
+                if eid in eventIds:
+                    log.error(f"ERROR: Duplicated EventId: {eid} Action: {action.actionId} {action.customName}")
+                    return False
+                if eid > maxEventId:
+                    maxEventId = eid
+                eventIds.add(eid)
+            for child in action.children:
+                actions.append(child)
+        for eid in range(1, maxEventId+1):
+            if not eid in eventIds:
+                log.error(f"ERROR: Missing EventId: {eid}")
+                return False
+        return True
+
+    def check_indirect_action_name_consistency(self, controller: rd.ReplayController) -> str:
+        actions = controller.GetRootActions().copy()
+        sdfile = controller.GetStructuredFile()
+        while len(actions) > 0:
+            action = actions.pop(0)
+            actions += action.children
+            actionName = action.customName if len(action.customName) > 0 else sdfile.chunks[action.events[-1].chunkIndex].name
+            event = None
+            # Action: Indirect sub-command*(<3,3>) : should have event Indirect sub-command({ 3,3 }) as its event
+            if actionName.startswith("Indirect sub-command"):
+                event = action.events[-1]
+            # Action: *Indirect(1) => <3,2> should have Indirect sub-command({ 3,2 }) as previous event
+            if "Indirect(1) => <" in actionName:
+                event = action.events[-2]
+
+            if event is not None:
+                chunkIndex = event.chunkIndex
+                eventChunk = sdfile.chunks[chunkIndex]
+                eventParameters = analyse.get_event_parameters_text(eventChunk)
+                paramStr = actionName.split("<")[1].split(">")[0]
+                actionParameters = paramStr
+                if actionParameters != eventParameters:
+                    log.error(f"EID:{action.eventId} Indirect action parameters {actionParameters} do not match event {eventParameters}")
+                    return False
+        
         return True

@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2025 Baldur Karlsson
+ * Copyright (c) 2017-2026 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -320,6 +320,7 @@ void MakeShaderReflection(DXBC::DXBCContainer *dxbc, const ShaderEntryPoint &ent
   }
 
   refl->debugInfo.entrySourceName = refl->entryPoint = "main";
+  refl->debugInfo.debugInfoLoadingLog = dxbc->GetDebugInfoLoadingLog();
 
   if(dxbc->GetDebugInfo())
   {
@@ -384,6 +385,19 @@ void MakeShaderReflection(DXBC::DXBCContainer *dxbc, const ShaderEntryPoint &ent
     else
       refl->debugInfo.debugStatus = "Shader contains no recognised bytecode";
   }
+
+  const DXBC::Reflection *dxbcRefl = dxbc->GetReflection();
+
+  for(const SigParameter &sig : dxbcRefl->InputSig)
+  {
+    if(sig.systemValue == ShaderBuiltin::PackedFragRate)
+    {
+      if(refl->debugInfo.debugStatus.empty())
+        refl->debugInfo.debugStatus = "Unsupported input value SV_ShadingRate";
+      break;
+    }
+  }
+
   refl->debugInfo.debuggable = refl->debugInfo.debugStatus.empty();
 
   refl->encoding = ShaderEncoding::DXBC;
@@ -394,8 +408,6 @@ void MakeShaderReflection(DXBC::DXBCContainer *dxbc, const ShaderEntryPoint &ent
     refl->debugInfo.compiler = KnownShaderTool::dxcDXIL;
   }
   refl->rawBytes = dxbc->GetShaderBlob();
-
-  const DXBC::Reflection *dxbcRefl = dxbc->GetReflection();
 
   refl->dispatchThreadsDimension[0] = dxbcRefl->DispatchThreadsDimension[0];
   refl->dispatchThreadsDimension[1] = dxbcRefl->DispatchThreadsDimension[1];

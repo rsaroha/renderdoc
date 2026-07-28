@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2020-2025 Baldur Karlsson
+ * Copyright (c) 2020-2026 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -30,7 +30,7 @@
 #include "spirv_common.h"
 #include "spirv_processor.h"
 
-#if defined(RELEASE)
+#if ENABLED(RDOC_RELEASE)
 #define SPIRV_DEBUG_RDCASSERT(...) \
   do                               \
   {                                \
@@ -109,9 +109,13 @@ public:
   virtual ~DebugAPIWrapper() {}
   virtual void AddDebugMessage(MessageCategory c, MessageSeverity sv, MessageSource src, rdcstr d) = 0;
 
+  virtual GraphicsAPI GetGraphicsAPI() = 0;
+  virtual bool SimulateThreaded() = 0;
   virtual ResourceId GetShaderID() = 0;
 
   virtual uint64_t GetBufferLength(const ShaderBindIndex &bind) = 0;
+
+  virtual void ReadLocationValue(int32_t location, ShaderVariable &var) = 0;
 
   virtual void ReadBufferValue(const ShaderBindIndex &bind, uint64_t offset, uint64_t byteSize,
                                void *dst) = 0;
@@ -127,7 +131,7 @@ public:
                                     uint32_t sample, const ShaderVariable &value) = 0;
 
   virtual void FillInputValue(ShaderVariable &var, ShaderBuiltin builtin, uint32_t threadIndex,
-                              uint32_t location, uint32_t component) = 0;
+                              uint32_t location, uint32_t component) const = 0;
 
   virtual uint32_t GetThreadProperty(uint32_t threadIndex, ThreadProperty prop) = 0;
   virtual bool IsImageCached(const ShaderBindIndex &bind) = 0;
@@ -152,10 +156,70 @@ public:
                                  const ShaderVariable &compare, GatherChannel gatherChannel,
                                  const rdcspv::ImageOperandsAndParamDatas &operands,
                                  ShaderVariable &output, bool &hasResult) = 0;
-  virtual bool QueueCalculateMathOp(GLSLstd450 op, const rdcarray<ShaderVariable> &params) = 0;
+  virtual bool QueueCalculateMathOp(Op opcode, GLSLstd450 op,
+                                    const rdcarray<ShaderVariable> &params) = 0;
   virtual bool GetQueuedResults(rdcarray<ShaderVariable *> &mathOpResults,
                                 rdcarray<ShaderVariable *> &sampleGatherResults) = 0;
   virtual bool QueuedOpsHasSpace() = 0;
+};
+
+// things we need to readback once per hit thread
+struct ResultDataBase
+{
+  Vec4f pos;
+
+  uint32_t prim;
+  uint32_t sample;
+  uint32_t view;
+  uint32_t valid;
+
+  float ddxDerivCheck;
+  uint32_t quadLaneIndex;
+  uint32_t laneIndex;
+  uint32_t subgroupSize;
+
+  uint32_t globalBallot[4];
+  uint32_t electBallot[4];
+  uint32_t helperBallot[4];
+
+  uint32_t numSubgroups;    // may be packed oddly so we don't assume we can calculate
+  uint32_t shadRate;
+  uint32_t padding[2];
+
+  // LaneData lanes[N]
+  // each LaneData is prefixed by the subgroup struct below if needed, and then the stage struct unconditionally
+};
+
+// things we need per-lane with subgroups active, before any per-stage data
+struct SubgroupLaneData
+{
+  uint32_t elect;       // for OpGroupNonUniformElect, if we don't have ballot
+  uint32_t isActive;    // per lane active mask
+  uint32_t padding[2];
+};
+
+struct VertexLaneData
+{
+  uint32_t inst;    // allow/expect instance to vary across subgroup just in case
+  uint32_t vert;    // vertex id (either auto-generated or index)
+  uint32_t view;    // multiview view (if used)
+  uint32_t padding;
+};
+
+struct PixelLaneData
+{
+  Vec4f fragCoord;      // per-lane coord
+  uint32_t isHelper;    // per-lane helper bit
+  uint32_t quadId;    // the per-quad ID shared among all 4 threads, to differentiate between quads.
+                      // is the laneIndex of the top-left thread (with an offset, so we can see 0 as invalid)
+  uint32_t quadLaneIndex;    // the quadLaneIndex for quad-neighbours, in case we are fetching a subgroup
+  uint32_t padding;
+};
+
+struct ComputeLaneData
+{
+  uint32_t threadid[3];    // per-lane thread id (in case it's not trivial)
+  uint32_t subIdxInGroup;
 };
 
 typedef ShaderVariable (*ExtInstImpl)(ThreadState &, uint32_t, const rdcarray<Id> &);
@@ -223,7 +287,8 @@ private:
 struct GpuMathOperation
 {
   uint32_t workgroupIndex;
-  GLSLstd450 op;
+  Op opcode;
+  GLSLstd450 glslop;
   rdcarray<ShaderVariable> paramVars;
   ShaderVariable *result;
 };
@@ -244,11 +309,20 @@ struct GpuSampleGatherOperation
   ShaderVariable *result = NULL;
 };
 
+enum class ShaderFeatures : uint32_t
+{
+  None = 0,
+  Derivatives = 1 << 0,
+};
+
+BITMASK_OPERATORS(ShaderFeatures);
+
 class Debugger;
 
 struct ThreadState
 {
-  ThreadState(Debugger &debug, const GlobalState &globalState);
+  ThreadState(Debugger &debug, const GlobalState &globalState, ShaderStage stage,
+              ShaderFeatures shaderFeatures);
   ~ThreadState();
 
   void EnterEntryPoint(bool useDebugState);
@@ -259,7 +333,7 @@ struct ThreadState
     DDX,
     DDY
   };
-  enum DerivType
+  enum class DerivType
   {
     Coarse,
     Fine
@@ -348,7 +422,7 @@ struct ThreadState
     Stepped,
   };
 
-  void QueueMathOp(GLSLstd450 op, const rdcarray<ShaderVariable> &paramVars,
+  void QueueMathOp(Op opcode, GLSLstd450 op, const rdcarray<ShaderVariable> &paramVars,
                    const ShaderVariable &result);
   void QueueSampleGather(Op opcode, DebugAPIWrapper::TextureType texType,
                          const ShaderBindIndex &imageBind, const ShaderBindIndex &samplerBind,
@@ -433,6 +507,7 @@ struct ThreadState
 private:
   void EnterFunction(const rdcarray<Id> &arguments);
   void SetDst(Id id, const ShaderVariable &val);
+  bool SetLive(Id id);
   void ProcessScopeChange(const rdcarray<Id> &oldLive, const rdcarray<Id> &newLive);
   void JumpToLabel(Id target);
   bool ReferencePointer(Id id);
@@ -453,6 +528,8 @@ private:
     AtomicStore(&atomic_pendingResultStatus, (int32_t)status);
   }
 
+  ShaderFeatures features;
+  DerivType defaultDeriveType;
   ShaderDebugState pendingDebugState;
   bool hasDebugState = false;
   uint32_t stepIndex = 0;
@@ -675,7 +752,8 @@ private:
 
   template <typename ShaderVarType, bool allocate>
   uint32_t WalkVariable(const Decorations &curDecorations, const DataType &type,
-                        uint64_t offsetOrLocation, ShaderVarType &var, const rdcstr &accessSuffix,
+                        uint64_t offsetOrLocation, bool locationUniform, ShaderVarType &var,
+                        const rdcstr &accessSuffix,
                         std::function<void(ShaderVarType &, const Decorations &, const DataType &,
                                            uint64_t, const rdcstr &)>
                             callback) const;

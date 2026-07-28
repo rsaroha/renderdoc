@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2025 Baldur Karlsson
+ * Copyright (c) 2015-2026 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -239,8 +239,13 @@ struct ConciseGraphicsPipeline
   uint32_t writeMask;
 };
 
+struct RareGraphicsProperties
+{
+  uint32_t viewCount = 1;
+};
+
 static void create(WrappedVulkan *driver, const char *objName, const int line, VkPipeline *pipe,
-                   const ConciseGraphicsPipeline &info)
+                   const ConciseGraphicsPipeline &info, const RareGraphicsProperties &extra = {})
 {
   // if the module didn't compile, this pipeline is not be supported. Silently don't create it, code
   // later should handle the missing pipeline as indicating lack of support
@@ -357,7 +362,7 @@ static void create(WrappedVulkan *driver, const char *objName, const int line, V
 
   VkPipelineViewportStateCreateInfo viewScissor = {
       VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
-  viewScissor.viewportCount = viewScissor.scissorCount = 1;
+  viewScissor.viewportCount = viewScissor.scissorCount = extra.viewCount;
 
   // add default scissor, if scissor is dynamic this will be ignored.
   VkRect2D scissor = {{0, 0}, {16384, 16384}};
@@ -1200,7 +1205,7 @@ void VulkanDebugManager::CreateCustomShaderPipeline(ResourceId shader, VkPipelin
       m_Custom.TexRP,
       pipeLayout,
       m_pDriver->GetShaderCache()->GetBuiltinModule(BuiltinShader::BlitVS),
-      m_pDriver->GetResourceManager()->GetCurrentHandle<VkShaderModule>(shader),
+      m_pDriver->GetResourceManager()->GetHandle<VkShaderModule>(shader),
       {VK_DYNAMIC_STATE_VIEWPORT},
       VK_SAMPLE_COUNT_1_BIT,
       false,    // sampleRateShading
@@ -1225,7 +1230,10 @@ uint32_t VulkanReplay::PickVertex(uint32_t eventId, int32_t width, int32_t heigh
 
   VkMarkerRegion::Begin(StringFormat::Fmt("VulkanReplay::PickVertex(%u, %u)", x, y));
 
-  Matrix4f projMat = Matrix4f::Perspective(90.0f, 0.1f, 100000.0f, float(width) / float(height));
+  float nearPlane = cfg.cam ? ((Camera *)cfg.cam)->GetNear() : 0.1f;
+  float farPlane = cfg.cam ? ((Camera *)cfg.cam)->GetFar() : 100000.0f;
+
+  Matrix4f projMat = Matrix4f::Perspective(90.0f, nearPlane, farPlane, float(width) / float(height));
 
   Matrix4f camMat = cfg.cam ? ((Camera *)cfg.cam)->GetMatrix() : Matrix4f::Identity();
   Matrix4f pickMVP = projMat.Mul(camMat);
@@ -1985,13 +1993,13 @@ void VulkanDebugManager::ResetBufferMSDescriptorPools()
 
 void VulkanDebugManager::GetBufferData(ResourceId buff, uint64_t offset, uint64_t len, bytebuf &ret)
 {
-  if(!m_pDriver->GetResourceManager()->HasCurrentResource(buff))
+  if(!m_pDriver->GetResourceManager()->HasResource(buff))
   {
     RDCERR("Getting buffer data for unknown buffer/memory %s!", ToStr(buff).c_str());
     return;
   }
 
-  WrappedVkRes *res = m_pDriver->GetResourceManager()->GetCurrentResource(buff);
+  WrappedVkRes *res = m_pDriver->GetResourceManager()->GetResource(buff);
 
   if(res == VK_NULL_HANDLE)
   {
@@ -2017,7 +2025,7 @@ void VulkanDebugManager::GetBufferData(ResourceId buff, uint64_t offset, uint64_
   }
   else if(WrappedVkBuffer::IsAlloc(res))
   {
-    unwrappedSrcBuf = Unwrap(m_pDriver->GetResourceManager()->GetCurrentHandle<VkBuffer>(buff));
+    unwrappedSrcBuf = Unwrap(m_pDriver->GetResourceManager()->GetHandle<VkBuffer>(buff));
     bufsize = m_pDriver->m_CreationInfo.m_Buffer[buff].size;
   }
   else
@@ -2698,8 +2706,10 @@ void VulkanDebugManager::FillWithDiscardPatternOnHost(VkDevice device, DiscardTy
   }
 }
 
-void VulkanDebugManager::InitReadbackBuffer(VkDeviceSize sz)
+VulkanDebugManager::ReadbackWindow VulkanDebugManager::LockReadbackBuffer(VkDeviceSize sz)
 {
+  m_ReadbackLock.Lock();
+
   if(m_ReadbackWindow.TotalSize() < sz)
   {
     if(m_ReadbackWindow.TotalSize() > 0)
@@ -2722,6 +2732,13 @@ void VulkanDebugManager::InitReadbackBuffer(VkDeviceSize sz)
       CHECK_VKR(m_pDriver, VK_ERROR_MEMORY_MAP_FAILED);
     }
   }
+
+  return {m_ReadbackWindow.UnwrappedBuffer(), m_ReadbackWindow.UnwrappedMemory(), m_ReadbackPtr};
+}
+
+void VulkanDebugManager::UnlockReadbackBuffer()
+{
+  m_ReadbackLock.Unlock();
 }
 
 void VulkanReplay::AllocAndAddReservedDescriptors(
@@ -3182,8 +3199,7 @@ void VulkanReplay::AllocAndAddReservedDescriptors(
           VkSampler *samplers = new VkSampler[layoutBind.descriptorCount];
           newBind.pImmutableSamplers = samplers;
           for(uint32_t s = 0; s < layoutBind.descriptorCount; s++)
-            samplers[s] =
-                GetResourceManager()->GetCurrentHandle<VkSampler>(layoutBind.immutableSampler[s]);
+            samplers[s] = GetResourceManager()->GetHandle<VkSampler>(layoutBind.immutableSampler[s]);
         }
         else
         {
@@ -3483,8 +3499,7 @@ VulkanReplay::AddedDescriptorData VulkanReplay::PrepareExtraBufferDescriptor(
         ret.setLayouts.reserve(sets.size());
 
         for(size_t i = 0; i < sets.size(); i++)
-          ret.setLayouts.push_back(
-              GetResourceManager()->GetCurrentHandle<VkDescriptorSetLayout>(sets[i]));
+          ret.setLayouts.push_back(GetResourceManager()->GetHandle<VkDescriptorSetLayout>(sets[i]));
       }
     }
 
@@ -4583,20 +4598,20 @@ void VulkanReplay::OverlayRendering::Init(WrappedVulkan *driver, VkDescriptorPoo
 
   CREATE_OBJECT(m_CheckerPipeLayout, m_CheckerDescSetLayout, 0);
   CREATE_OBJECT(m_QuadResolvePipeLayout, m_QuadDescSetLayout, 0);
-  CREATE_OBJECT(m_TriSizePipeLayout, m_TriSizeDescSetLayout, 0);
+  CREATE_OBJECT(m_TriSizePipeLayout, m_TriSizeDescSetLayout, 4);
   CREATE_OBJECT(m_DepthCopyPipeLayout, m_DepthCopyDescSetLayout, 0);
   CREATE_OBJECT(m_QuadDescSet, descriptorPool, m_QuadDescSetLayout);
   CREATE_OBJECT(m_TriSizeDescSet, descriptorPool, m_TriSizeDescSetLayout);
   CREATE_OBJECT(m_CheckerDescSet, descriptorPool, m_CheckerDescSetLayout);
   CREATE_OBJECT(m_DepthCopyDescSet, descriptorPool, m_DepthCopyDescSetLayout);
 
-  m_CheckerUBO.Create(driver, driver->GetDev(), 128, 10, 0);
+  m_CheckerUBO.Create(driver, driver->GetDev(), 128, 64, 0);
   m_CheckerUBO.Name("m_CheckerUBO");
   RDCCOMPILE_ASSERT(sizeof(CheckerboardUBOData) <= 128, "checkerboard UBO size");
 
   m_DummyMeshletSSBO.Create(driver, driver->GetDev(), sizeof(Vec4f) * 2, 1,
                             GPUBuffer::eGPUBufferSSBO);
-  m_TriSizeUBO.Create(driver, driver->GetDev(), sizeof(Vec4f), 4096, 0);
+  m_TriSizeUBO.Create(driver, driver->GetDev(), sizeof(Vec4f), 4096, 32);
   m_DummyMeshletSSBO.Name("m_DummyMeshletSSBO");
   m_TriSizeUBO.Name("m_TriSizeUBO");
 
@@ -4627,12 +4642,9 @@ void VulkanReplay::OverlayRendering::Init(WrappedVulkan *driver, VkDescriptorPoo
 
   uint32_t samplesHandled = 0;
 
-  RDCCOMPILE_ASSERT(ARRAY_COUNT(m_CheckerF16Pipeline) == ARRAY_COUNT(m_QuadResolvePipeline),
-                    "Arrays are mismatched in size!");
-
   uint32_t supportedColorSampleCounts = driver->GetDeviceProps().limits.framebufferColorSampleCounts;
 
-  for(size_t i = 0; i < ARRAY_COUNT(m_CheckerF16Pipeline); i++)
+  for(size_t i = 0; i < ARRAY_COUNT(m_QuadResolvePipeline); i++)
   {
     VkSampleCountFlagBits samples = VkSampleCountFlagBits(1 << i);
 
@@ -4651,13 +4663,6 @@ void VulkanReplay::OverlayRendering::Init(WrappedVulkan *driver, VkDescriptorPoo
     // if we know this sample count is supported then create a pipeline
     pipeInfo.renderPass = RGBA16MSRP;
     pipeInfo.sampleCount = VkSampleCountFlagBits(1 << i);
-
-    // set up outline pipeline configuration
-    pipeInfo.blendEnable = true;
-    pipeInfo.fragment = shaderCache->GetBuiltinModule(BuiltinShader::CheckerboardFS);
-    pipeInfo.pipeLayout = m_CheckerPipeLayout;
-
-    CREATE_OBJECT(m_CheckerF16Pipeline[i], pipeInfo);
 
     // set up quad resolve pipeline configuration
     pipeInfo.blendEnable = false;
@@ -4966,6 +4971,39 @@ void VulkanReplay::OverlayRendering::Init(WrappedVulkan *driver, VkDescriptorPoo
   driver->vkDestroyRenderPass(driver->GetDev(), SRGBA8MSRP, NULL);
 }
 
+VkPipeline VulkanReplay::OverlayRendering::CreateTempViewportPipe(WrappedVulkan *driver,
+                                                                  uint32_t viewCount)
+{
+  VulkanShaderCache *shaderCache = driver->GetShaderCache();
+
+  ConciseGraphicsPipeline pipeInfo = {
+      NoDepthRP,
+      m_CheckerPipeLayout,
+      shaderCache->GetBuiltinModule(BuiltinShader::BlitVS),
+      shaderCache->GetBuiltinModule(MultiViewMask ? BuiltinShader::CheckerboardMultiviewFS
+                                                  : BuiltinShader::CheckerboardFS),
+      {VK_DYNAMIC_STATE_VIEWPORT},
+      Samples,
+      false,    // sampleRateShading
+      false,    // depthEnable
+      false,    // stencilEnable
+      StencilMode::KEEP,
+      true,    // colourOutput
+      true,    // blendEnable
+      VK_BLEND_FACTOR_SRC_ALPHA,
+      VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+      0xf,    // writeMask
+  };
+
+  RareGraphicsProperties extra;
+  extra.viewCount = viewCount;
+
+  VkPipeline ret;
+  CREATE_OBJECT(ret, pipeInfo, extra);
+
+  return ret;
+}
+
 VkPipeline VulkanReplay::OverlayRendering::CreateTempMultiviewQuadResolvePipe(WrappedVulkan *driver)
 {
   VulkanShaderCache *shaderCache = driver->GetShaderCache();
@@ -5028,8 +5066,6 @@ void VulkanReplay::OverlayRendering::Destroy(WrappedVulkan *driver)
 
   driver->vkDestroyDescriptorSetLayout(driver->GetDev(), m_CheckerDescSetLayout, NULL);
   driver->vkDestroyPipelineLayout(driver->GetDev(), m_CheckerPipeLayout, NULL);
-  for(size_t i = 0; i < ARRAY_COUNT(m_CheckerF16Pipeline); i++)
-    driver->vkDestroyPipeline(driver->GetDev(), m_CheckerF16Pipeline[i], NULL);
   driver->vkDestroyPipeline(driver->GetDev(), m_CheckerPipeline, NULL);
   driver->vkDestroyPipeline(driver->GetDev(), m_CheckerMSAAPipeline, NULL);
 

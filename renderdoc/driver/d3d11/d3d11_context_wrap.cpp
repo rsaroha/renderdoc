@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2025 Baldur Karlsson
+ * Copyright (c) 2015-2026 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -29,6 +29,7 @@
 #include "tinyfiledialogs/tinyfiledialogs.h"
 #include "d3d11_debug.h"
 #include "d3d11_renderstate.h"
+#include "d3d11_replay.h"
 #include "d3d11_resources.h"
 
 #ifndef DXGI_ERROR_INVALID_CALL
@@ -186,6 +187,118 @@ int WrappedID3D11DeviceContext::PopMarker()
   }
 
   return --m_MarkerIndentLevel;
+}
+
+template <typename SerialiserType>
+bool WrappedID3D11DeviceContext::Serialise_SetCommandAnnotation(SerialiserType &ser, rdcstr key,
+                                                                RENDERDOC_AnnotationType valueType,
+                                                                uint32_t valueVectorWidth,
+                                                                RENDERDOC_AnnotationValue value)
+{
+  SERIALISE_ELEMENT(key);
+  SERIALISE_ELEMENT(valueType);
+  ser.SetStructArg(valueType);
+  SERIALISE_ELEMENT(valueVectorWidth);
+  SERIALISE_ELEMENT(value);
+
+  SERIALISE_CHECK_READ_ERRORS();
+
+  if(IsReplayingAndReading())
+  {
+    if(IsLoading(m_State))
+    {
+      if(!m_RootAnnotation)
+        m_RootAnnotation = new SDObject("Event Annotations"_lit, "Event Annotations"_lit);
+
+      SDObject *root = m_RootAnnotation;
+
+      if(valueType == eRENDERDOC_Empty)
+      {
+        root->EraseChildByKeyPath(key);
+      }
+      else
+      {
+        WriteAnnotation(root->CreateChildByKeyPath(key), valueType, valueVectorWidth, value);
+      }
+
+      m_pDevice->GetReplay()->WriteFrameRecord().frameInfo.containsAnnotations = true;
+    }
+  }
+
+  return true;
+}
+
+uint32_t WrappedID3D11DeviceContext::SetCommandAnnotation(const char *key,
+                                                          RENDERDOC_AnnotationType valueType,
+                                                          uint32_t valueVectorWidth,
+                                                          const RENDERDOC_AnnotationValue *value)
+{
+  SERIALISE_TIME_CALL();
+
+  if(IsActiveCapturing(m_State))
+  {
+    USE_SCRATCH_SERIALISER();
+    GET_SERIALISER.SetActionChunk();
+    SCOPED_SERIALISE_CHUNK(D3D11Chunk::SetCommandAnnotation);
+    SERIALISE_ELEMENT(m_ResourceID).Named("Context"_lit).TypedAs("ID3D11DeviceContext *"_lit);
+
+    RENDERDOC_AnnotationValue val = value ? *value : RENDERDOC_AnnotationValue();
+
+    if(valueType == eRENDERDOC_APIObject && val.apiObject)
+    {
+      ResourceId id = GetIDForDeviceChild((ID3D11DeviceChild *)val.apiObject);
+      RDCCOMPILE_ASSERT(sizeof(val.uint64) == sizeof(id), "ResourceId isn't 64-bit!");
+      memcpy(&val.uint64, &id, sizeof(id));
+    }
+
+    Serialise_SetCommandAnnotation(GET_SERIALISER, key, valueType, valueVectorWidth, val);
+
+    m_ContextRecord->AddChunk(scope.Get());
+  }
+
+  return 0;
+}
+
+uint32_t WrappedID3D11DeviceContext::SetObjectAnnotation(void *object, const char *key,
+                                                         RENDERDOC_AnnotationType valueType,
+                                                         uint32_t valueVectorWidth,
+                                                         const RENDERDOC_AnnotationValue *value)
+{
+  ResourceId id = GetIDForDeviceChild((ID3D11DeviceChild *)object);
+
+  if(id != ResourceId())
+  {
+    RENDERDOC_AnnotationValue val = value ? *value : RENDERDOC_AnnotationValue();
+
+    // Convert API object references to ResourceId
+    if(valueType == eRENDERDOC_APIObject && val.apiObject)
+    {
+      ResourceId valId = GetIDForDeviceChild((ID3D11DeviceChild *)val.apiObject);
+      RDCCOMPILE_ASSERT(sizeof(val.uint64) == sizeof(valId), "ResourceId isn't 64-bit!");
+      memcpy(&val.uint64, &valId, sizeof(valId));
+    }
+
+    SDObject *root = NULL;
+    {
+      SCOPED_LOCK(m_AnnotationsLock);
+      root = m_Annotations[id];
+      if(!root)
+        root = m_Annotations[id] = new SDObject("Object Annotations"_lit, "Object Annotations"_lit);
+    }
+
+    if(valueType == eRENDERDOC_Empty)
+    {
+      root->EraseChildByKeyPath(key);
+    }
+    else
+    {
+      WriteAnnotation(root->CreateChildByKeyPath(key), valueType, valueVectorWidth, val);
+    }
+
+    return 0;
+  }
+
+  return 2;
 }
 
 void WrappedID3D11DeviceContext::ThreadSafe_SetMarker(uint32_t col, const wchar_t *name)
@@ -5476,7 +5589,7 @@ HRESULT WrappedID3D11DeviceContext::FinishCommandList(BOOL RestoreDeferredContex
     cmdListSuccessful = false;
 
   WrappedID3D11CommandList *wrapped =
-      new WrappedID3D11CommandList(real, m_pDevice, this, cmdListSuccessful);
+      new WrappedID3D11CommandList(ResourceId(), real, m_pDevice, this, cmdListSuccessful);
 
   if(IsCaptureMode(m_State))
   {
@@ -5680,10 +5793,8 @@ bool WrappedID3D11DeviceContext::Serialise_CopySubresourceRegion(
 
     if(IsLoading(m_State))
     {
-      ResourceId dstLiveID = GetIDForDeviceChild(pDstResource);
-      ResourceId srcLiveID = GetIDForDeviceChild(pSrcResource);
-      ResourceId dstOrigID = GetResourceManager()->GetOriginalID(dstLiveID);
-      ResourceId srcOrigID = GetResourceManager()->GetOriginalID(srcLiveID);
+      ResourceId dstID = GetIDForDeviceChild(pDstResource);
+      ResourceId srcID = GetIDForDeviceChild(pSrcResource);
 
       AddEvent();
 
@@ -5692,26 +5803,26 @@ bool WrappedID3D11DeviceContext::Serialise_CopySubresourceRegion(
 
       if(pDstResource && pSrcResource)
       {
-        action.copySource = srcOrigID;
+        action.copySource = srcID;
         action.copySourceSubresource =
             Subresource(GetMipForSubresource(pSrcResource, SrcSubresource),
                         GetSliceForSubresource(pSrcResource, SrcSubresource));
 
-        action.copyDestination = dstOrigID;
+        action.copyDestination = dstID;
         action.copyDestinationSubresource =
             Subresource(GetMipForSubresource(pDstResource, DstSubresource),
                         GetSliceForSubresource(pDstResource, DstSubresource));
 
         if(m_CurEventID)
         {
-          if(dstLiveID == srcLiveID)
+          if(dstID == srcID)
           {
-            m_ResourceUses[dstLiveID].push_back(EventUsage(m_CurEventID, ResourceUsage::Copy));
+            m_ResourceUses[dstID].push_back(EventUsage(m_CurEventID, ResourceUsage::Copy));
           }
           else
           {
-            m_ResourceUses[dstLiveID].push_back(EventUsage(m_CurEventID, ResourceUsage::CopyDst));
-            m_ResourceUses[srcLiveID].push_back(EventUsage(m_CurEventID, ResourceUsage::CopySrc));
+            m_ResourceUses[dstID].push_back(EventUsage(m_CurEventID, ResourceUsage::CopyDst));
+            m_ResourceUses[srcID].push_back(EventUsage(m_CurEventID, ResourceUsage::CopySrc));
           }
         }
       }
@@ -5837,10 +5948,8 @@ bool WrappedID3D11DeviceContext::Serialise_CopyResource(SerialiserType &ser,
 
     if(IsLoading(m_State))
     {
-      ResourceId dstLiveID = GetIDForDeviceChild(pDstResource);
-      ResourceId srcLiveID = GetIDForDeviceChild(pSrcResource);
-      ResourceId dstOrigID = GetResourceManager()->GetOriginalID(dstLiveID);
-      ResourceId srcOrigID = GetResourceManager()->GetOriginalID(srcLiveID);
+      ResourceId dstID = GetIDForDeviceChild(pDstResource);
+      ResourceId srcID = GetIDForDeviceChild(pSrcResource);
 
       AddEvent();
 
@@ -5849,21 +5958,21 @@ bool WrappedID3D11DeviceContext::Serialise_CopyResource(SerialiserType &ser,
 
       if(pDstResource && pSrcResource)
       {
-        action.copySource = srcOrigID;
+        action.copySource = srcID;
         action.copySourceSubresource = Subresource();
-        action.copyDestination = dstOrigID;
+        action.copyDestination = dstID;
         action.copyDestinationSubresource = Subresource();
 
         if(m_CurEventID)
         {
-          if(dstLiveID == srcLiveID)
+          if(dstID == srcID)
           {
-            m_ResourceUses[dstLiveID].push_back(EventUsage(m_CurEventID, ResourceUsage::Copy));
+            m_ResourceUses[dstID].push_back(EventUsage(m_CurEventID, ResourceUsage::Copy));
           }
           else
           {
-            m_ResourceUses[dstLiveID].push_back(EventUsage(m_CurEventID, ResourceUsage::CopyDst));
-            m_ResourceUses[srcLiveID].push_back(EventUsage(m_CurEventID, ResourceUsage::CopySrc));
+            m_ResourceUses[dstID].push_back(EventUsage(m_CurEventID, ResourceUsage::CopyDst));
+            m_ResourceUses[srcID].push_back(EventUsage(m_CurEventID, ResourceUsage::CopySrc));
           }
         }
       }
@@ -6277,30 +6386,28 @@ bool WrappedID3D11DeviceContext::Serialise_CopyStructureCount(SerialiserType &se
     {
       WrappedID3D11UnorderedAccessView1 *view = (WrappedID3D11UnorderedAccessView1 *)pSrcView;
 
-      ResourceId dstLiveID = GetIDForDeviceChild(pDstBuffer);
-      ResourceId srcLiveID = view->GetResourceResID();
-      ResourceId dstOrigID = GetResourceManager()->GetOriginalID(dstLiveID);
-      ResourceId srcOrigID = GetResourceManager()->GetOriginalID(srcLiveID);
+      ResourceId dstID = GetIDForDeviceChild(pDstBuffer);
+      ResourceId srcID = view->GetResourceResID();
 
       AddEvent();
 
       ActionDescription action;
       action.flags |= ActionFlags::Copy;
-      action.copySource = srcOrigID;
+      action.copySource = srcID;
       action.copySourceSubresource = Subresource();
-      action.copyDestination = dstOrigID;
+      action.copyDestination = dstID;
       action.copyDestinationSubresource = Subresource();
 
       if(m_CurEventID)
       {
-        if(dstLiveID == srcLiveID)
+        if(dstID == srcID)
         {
-          m_ResourceUses[dstLiveID].push_back(EventUsage(m_CurEventID, ResourceUsage::Copy));
+          m_ResourceUses[dstID].push_back(EventUsage(m_CurEventID, ResourceUsage::Copy));
         }
         else
         {
-          m_ResourceUses[dstLiveID].push_back(EventUsage(m_CurEventID, ResourceUsage::CopyDst));
-          m_ResourceUses[srcLiveID].push_back(EventUsage(m_CurEventID, ResourceUsage::CopySrc));
+          m_ResourceUses[dstID].push_back(EventUsage(m_CurEventID, ResourceUsage::CopyDst));
+          m_ResourceUses[srcID].push_back(EventUsage(m_CurEventID, ResourceUsage::CopySrc));
         }
       }
 
@@ -6387,10 +6494,8 @@ bool WrappedID3D11DeviceContext::Serialise_ResolveSubresource(SerialiserType &se
 
     if(IsLoading(m_State))
     {
-      ResourceId dstLiveID = GetIDForDeviceChild(pDstResource);
-      ResourceId srcLiveID = GetIDForDeviceChild(pSrcResource);
-      ResourceId dstOrigID = GetResourceManager()->GetOriginalID(dstLiveID);
-      ResourceId srcOrigID = GetResourceManager()->GetOriginalID(srcLiveID);
+      ResourceId dstID = GetIDForDeviceChild(pDstResource);
+      ResourceId srcID = GetIDForDeviceChild(pSrcResource);
 
       AddEvent();
 
@@ -6399,25 +6504,25 @@ bool WrappedID3D11DeviceContext::Serialise_ResolveSubresource(SerialiserType &se
 
       if(pDstResource && pSrcResource)
       {
-        action.copySource = srcOrigID;
+        action.copySource = srcID;
         action.copySourceSubresource =
             Subresource(GetMipForSubresource(pSrcResource, SrcSubresource),
                         GetSliceForSubresource(pSrcResource, SrcSubresource));
-        action.copyDestination = dstOrigID;
+        action.copyDestination = dstID;
         action.copyDestinationSubresource =
             Subresource(GetMipForSubresource(pDstResource, DstSubresource),
                         GetSliceForSubresource(pDstResource, DstSubresource));
 
         if(m_CurEventID)
         {
-          if(dstLiveID == srcLiveID)
+          if(dstID == srcID)
           {
-            m_ResourceUses[dstLiveID].push_back(EventUsage(m_CurEventID, ResourceUsage::Resolve));
+            m_ResourceUses[dstID].push_back(EventUsage(m_CurEventID, ResourceUsage::Resolve));
           }
           else
           {
-            m_ResourceUses[dstLiveID].push_back(EventUsage(m_CurEventID, ResourceUsage::ResolveDst));
-            m_ResourceUses[srcLiveID].push_back(EventUsage(m_CurEventID, ResourceUsage::ResolveSrc));
+            m_ResourceUses[dstID].push_back(EventUsage(m_CurEventID, ResourceUsage::ResolveDst));
+            m_ResourceUses[srcID].push_back(EventUsage(m_CurEventID, ResourceUsage::ResolveSrc));
           }
         }
       }
@@ -6490,7 +6595,7 @@ bool WrappedID3D11DeviceContext::Serialise_GenerateMips(SerialiserType &ser,
       if(view)
       {
         m_ResourceUses[view->GetResourceResID()].push_back(
-            EventUsage(m_CurEventID, ResourceUsage::GenMips, view->GetResourceID()));
+            EventUsage(m_CurEventID, ResourceUsage::GenMips));
       }
 
       AddEvent();
@@ -6650,9 +6755,8 @@ bool WrappedID3D11DeviceContext::Serialise_ClearRenderTargetView(
       if(view)
       {
         m_ResourceUses[view->GetResourceResID()].push_back(
-            EventUsage(m_CurEventID, ResourceUsage::Clear, view->GetResourceID()));
-        action.copyDestination =
-            m_pDevice->GetResourceManager()->GetOriginalID(view->GetResourceResID());
+            EventUsage(m_CurEventID, ResourceUsage::Clear));
+        action.copyDestination = view->GetResourceResID();
         D3D11_RENDER_TARGET_VIEW_DESC viewDesc;
         view->GetDesc(&viewDesc);
         action.copyDestinationSubresource =
@@ -6733,9 +6837,8 @@ bool WrappedID3D11DeviceContext::Serialise_ClearUnorderedAccessViewUint(
       if(view)
       {
         m_ResourceUses[view->GetResourceResID()].push_back(
-            EventUsage(m_CurEventID, ResourceUsage::Clear, view->GetResourceID()));
-        action.copyDestination =
-            m_pDevice->GetResourceManager()->GetOriginalID(view->GetResourceResID());
+            EventUsage(m_CurEventID, ResourceUsage::Clear));
+        action.copyDestination = view->GetResourceResID();
         action.copyDestinationSubresource = Subresource();
       }
 
@@ -6812,9 +6915,8 @@ bool WrappedID3D11DeviceContext::Serialise_ClearUnorderedAccessViewFloat(
       if(view)
       {
         m_ResourceUses[view->GetResourceResID()].push_back(
-            EventUsage(m_CurEventID, ResourceUsage::Clear, view->GetResourceID()));
-        action.copyDestination =
-            m_pDevice->GetResourceManager()->GetOriginalID(view->GetResourceResID());
+            EventUsage(m_CurEventID, ResourceUsage::Clear));
+        action.copyDestination = view->GetResourceResID();
         action.copyDestinationSubresource = Subresource();
       }
 
@@ -6897,9 +6999,8 @@ bool WrappedID3D11DeviceContext::Serialise_ClearDepthStencilView(
       if(view)
       {
         m_ResourceUses[view->GetResourceResID()].push_back(
-            EventUsage(m_CurEventID, ResourceUsage::Clear, view->GetResourceID()));
-        action.copyDestination =
-            m_pDevice->GetResourceManager()->GetOriginalID(view->GetResourceResID());
+            EventUsage(m_CurEventID, ResourceUsage::Clear));
+        action.copyDestination = view->GetResourceResID();
         D3D11_DEPTH_STENCIL_VIEW_DESC viewDesc;
         view->GetDesc(&viewDesc);
         action.copyDestinationSubresource =
@@ -8165,3 +8266,4 @@ void WrappedID3D11DeviceContext::Unmap(ID3D11Resource *pResource, UINT Subresour
 
 SERIALISED_ID3D11CONTEXT_FUNCTIONS();
 SERIALISED_ID3D11CONTEXT_MARKER_FUNCTIONS();
+SERIALISED_ID3D11CONTEXT_ANNOTATION_FUNCTIONS();

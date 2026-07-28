@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2025 Baldur Karlsson
+ * Copyright (c) 2015-2026 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -38,6 +38,9 @@ RDOC_CONFIG(
     "By default we have no choice but to replace VkApplicationInfo to safely work on all drivers. "
     "This behaviour can be disabled with this flag, which lets it through both during capture and "
     "on replay.");
+
+RDOC_CONFIG(bool, Vulkan_Debug_EnableGPUVA, false,
+            "Enable GPU Validation when enabling Vulkan validation.");
 
 // intercept and overwrite the application info if present. We must use the same appinfo on
 // capture and replay, and the safer default is not to replay as if we were the original app but
@@ -196,17 +199,21 @@ static void StripUnwantedExtensions(rdcarray<rdcstr> &Extensions)
        ext == "VK_EXT_present_mode_fifo_latest_ready" || ext == "VK_EXT_surface_maintenance1" ||
        ext == "VK_EXT_swapchain_maintenance1" || ext == "VK_KHR_surface_maintenance1" ||
        ext == "VK_KHR_swapchain_maintenance1" || ext == "VK_EXT_hdr_metadata" ||
-       ext == "VK_KHR_get_display_properties2")
+       ext == "VK_KHR_get_display_properties2" || ext == "VK_EXT_present_timing")
       return true;
 
     // remove fullscreen exclusive extension
     if(ext == "VK_EXT_full_screen_exclusive")
       return true;
 
+    // we do not replay any drm features
+    if(ext == "VK_EXT_image_drm_format_modifier")
+      return true;
+
     // this is debug only, nothing to capture, so nothing to replay
     if(ext == "VK_EXT_tooling_info" || ext == "VK_EXT_private_data" ||
        ext == "VK_EXT_validation_features" || ext == "VK_EXT_validation_cache" ||
-       ext == "VK_EXT_validation_flags")
+       ext == "VK_EXT_validation_flags" || ext == "VK_EXT_layer_settings")
       return true;
 
     // these are debug only and will be added (if supported) as optional
@@ -387,9 +394,8 @@ RDResult WrappedVulkan::Initialise(VkInitParams &params, uint64_t sectionVersion
   featuresEXT.disabledValidationFeatureCount = ARRAY_COUNT(disableFeatures);
   featuresEXT.pDisabledValidationFeatures = disableFeatures;
 
-// enable this to get GPU-based validation, where available, whenever we enable API validation
-#if 0
-  if(m_ReplayOptions.apiValidation)
+  // enable this to get GPU-based validation, where available, whenever we enable API validation
+  if(m_ReplayOptions.apiValidation && Vulkan_Debug_EnableGPUVA())
   {
     VkValidationFeatureEnableEXT enableFeatures[] = {
         VK_VALIDATION_FEATURE_ENABLE_GPU_ASSISTED_EXT,
@@ -397,7 +403,6 @@ RDResult WrappedVulkan::Initialise(VkInitParams &params, uint64_t sectionVersion
     featuresEXT.enabledValidationFeatureCount = ARRAY_COUNT(enableFeatures);
     featuresEXT.pEnabledValidationFeatures = enableFeatures;
   }
-#endif
 
   VkValidationFlagsEXT flagsEXT = {VK_STRUCTURE_TYPE_VALIDATION_FLAGS_EXT};
   VkValidationCheckEXT disableChecks[] = {VK_VALIDATION_CHECK_SHADERS_EXT};
@@ -487,19 +492,13 @@ RDResult WrappedVulkan::Initialise(VkInitParams &params, uint64_t sectionVersion
 
   RDCASSERTEQUAL(ret, VK_SUCCESS);
 
-  GetResourceManager()->WrapResource(m_Instance, m_Instance);
+  GetResourceManager()->WrapResource(params.InstanceID, m_Instance, m_Instance);
 
   // we'll add the chunk later when we re-process it.
   if(params.InstanceID != ResourceId())
   {
-    GetResourceManager()->AddLiveResource(params.InstanceID, m_Instance);
-
     AddResource(params.InstanceID, ResourceType::Device, "Instance");
     GetReplay()->GetResourceDesc(params.InstanceID).initialisationChunks.clear();
-  }
-  else
-  {
-    GetResourceManager()->AddLiveResource(GetResID(m_Instance), m_Instance);
   }
 
   InitInstanceExtensionTables(m_Instance, &m_EnabledExtensions);
@@ -559,8 +558,11 @@ RDResult WrappedVulkan::Initialise(VkInitParams &params, uint64_t sectionVersion
             ->EnumeratePhysicalDevices(Unwrap(m_Instance), &count, &m_ReplayPhysicalDevices[0]);
   CHECK_VKR(this, vkr);
 
+  // these are only used internally, since due to physical device remapping the actual registered
+  // resource is created as a fake physical device and that's where we register them by their
+  // capture-time ID. These can safely be created with replay-only IDs.
   for(uint32_t i = 0; i < count; i++)
-    GetResourceManager()->WrapResource(m_Instance, m_ReplayPhysicalDevices[i]);
+    GetResourceManager()->WrapResource(ResourceId(), m_Instance, m_ReplayPhysicalDevices[i]);
 
 #if ENABLED(RDOC_WIN32)
   if(GetModuleHandleA("nvoglv64.dll"))
@@ -832,7 +834,7 @@ VkResult WrappedVulkan::vkCreateInstance(const VkInstanceCreateInfo *pCreateInfo
 
   InitInstanceTable(m_Instance, gpa);
 
-  GetResourceManager()->WrapResource(m_Instance, m_Instance);
+  GetResourceManager()->WrapResource(ResourceId(), m_Instance, m_Instance);
 
   *pInstance = m_Instance;
 
@@ -1045,13 +1047,17 @@ void WrappedVulkan::Shutdown()
   // destroy the physical devices manually because due to remapping the may have leftover
   // refcounts
   for(size_t i = 0; i < m_ReplayPhysicalDevices.size(); i++)
-    GetResourceManager()->ReleaseWrappedResource(m_ReplayPhysicalDevices[i]);
+  {
+    if(m_ReplayPhysicalDevices[i] != VK_NULL_HANDLE)
+      GetResourceManager()->ReleaseWrappedResource(m_ReplayPhysicalDevices[i]);
+  }
 
   m_ASManager->Cleanup();
 
   m_Replay->DestroyResources();
 
   m_IndirectBuffer.Destroy();
+  m_IndirectBufferCB.Destroy();
 
   // destroy debug manager and any objects it created
   SAFE_DELETE(m_DebugManager);
@@ -1444,24 +1450,21 @@ bool WrappedVulkan::Serialise_vkEnumeratePhysicalDevices(SerialiserType &ser, Vk
 
     pd = m_ReplayPhysicalDevices[bestIdx];
 
+    // we want to preserve the separate physical devices until we actually need the real handle,
+    // so don't remap multiple capture-time physical devices to one replay-time physical device
+    // yet. See below in Serialise_vkCreateDevice where this is decoded.
+    // Note this allocation is pooled so we don't have to explicitly delete it.
     {
       VkPhysicalDevice fakeDevice = MakePhysicalDeviceHandleFromIndex(PhysicalDeviceIndex);
 
-      ResourceId id = ResourceIDGen::GetNewUniqueID();
-      WrappedVkPhysicalDevice *wrapped = new WrappedVkPhysicalDevice(fakeDevice, id);
+      WrappedVkPhysicalDevice *wrapped = new WrappedVkPhysicalDevice(fakeDevice, PhysicalDevice);
 
-      GetResourceManager()->AddCurrentResource(id, wrapped);
+      GetResourceManager()->AddResource(PhysicalDevice, wrapped);
 
       if(IsReplayMode(m_State))
         GetResourceManager()->AddWrapper(wrapped, ToTypedHandle(fakeDevice));
 
       fakeDevice = (VkPhysicalDevice)wrapped;
-
-      // we want to preserve the separate physical devices until we actually need the real handle,
-      // so don't remap multiple capture-time physical devices to one replay-time physical device
-      // yet. See below in Serialise_vkCreateDevice where this is decoded.
-      // Note this allocation is pooled so we don't have to explicitly delete it.
-      GetResourceManager()->AddLiveResource(PhysicalDevice, fakeDevice);
     }
 
     AddResource(PhysicalDevice, ResourceType::Device, "Physical Device");
@@ -1516,7 +1519,7 @@ VkResult WrappedVulkan::vkEnumeratePhysicalDevices(VkInstance instance,
     }
     else
     {
-      GetResourceManager()->WrapResource(instance, devices[i]);
+      GetResourceManager()->WrapResource(ResourceId(), instance, devices[i]);
 
       if(IsCaptureMode(m_State))
       {
@@ -1706,14 +1709,12 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
   if(IsReplayingAndReading())
   {
     // kept around only to call DerivedResource below, as this is the resource that actually has an
-    // original resource ID.
+    // capture time resource ID.
     VkPhysicalDevice origPhysDevice = physicalDevice;
 
     // see above in Serialise_vkEnumeratePhysicalDevices where this is encoded
     uint32_t physicalDeviceIndex = GetPhysicalDeviceIndexFromHandle(Unwrap(physicalDevice));
     physicalDevice = m_PhysicalDevices[physicalDeviceIndex];
-
-    RDCLOG("Creating replay device from physical device %u", physicalDeviceIndex);
 
     ObjDisp(physicalDevice)
         ->GetPhysicalDeviceProperties(Unwrap(physicalDevice), &m_PhysicalDeviceData.props);
@@ -1729,6 +1730,9 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
 
     m_PhysicalDeviceData.driverInfo =
         VkDriverInfo(m_PhysicalDeviceData.props, m_PhysicalDeviceData.driverProps, true);
+
+    RDCLOG("Creating replay device from physical device at capture-time index %u (%s)",
+           physicalDeviceIndex, m_PhysicalDeviceData.props.deviceName);
 
     rdcarray<VkDeviceQueueGlobalPriorityCreateInfo *> queuePriorities;
 
@@ -2256,9 +2260,11 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
         RemoveNextStruct(&createInfo, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_2_FEATURES_KHR);
     present_exts |= RemoveNextStruct(
         &createInfo, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_MODE_FIFO_LATEST_READY_FEATURES_KHR);
+    present_exts |=
+        RemoveNextStruct(&createInfo, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_TIMING_FEATURES_EXT);
     if(present_exts)
     {
-      RDCLOG("Removed VK_KHR_present_id/wait/latest_ready structs from vkCreateDevice pNext chain");
+      RDCLOG("Removed present-related structs from vkCreateDevice pNext chain");
     }
 
     VkPhysicalDeviceFeatures enabledFeatures = {0};
@@ -2389,6 +2395,18 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
         CHECK_PHYS_EXT_FEATURE(shaderDrawParameters);
 
         m_MultiView |= ext->multiview != VK_FALSE;
+
+        if(m_MultiView)
+        {
+          if(avail.multiviewGeometryShader)
+            ext->multiviewGeometryShader = true;
+          else
+            RDCWARN(
+                "multiviewGeometryShader = false, triangle size overlay with multiview "
+                "unavailable");
+
+          m_MultiViewGeometryShaders |= ext->multiviewGeometryShader != VK_FALSE;
+        }
       }
       END_PHYS_EXT_CHECK();
 
@@ -3526,6 +3544,22 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
       }
       END_PHYS_EXT_CHECK();
 
+      BEGIN_PHYS_EXT_CHECK(
+          VkPhysicalDeviceRayTracingInvocationReorderFeaturesEXT,
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(rayTracingInvocationReorder);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(
+          VkPhysicalDeviceRayTracingInvocationReorderFeaturesNV,
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_FEATURES_NV);
+      {
+        CHECK_PHYS_EXT_FEATURE(rayTracingInvocationReorder);
+      }
+      END_PHYS_EXT_CHECK();
+
       BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceMaintenance5Features,
                            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES);
       {
@@ -3641,6 +3675,123 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
                            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES);
       {
         CHECK_PHYS_EXT_FEATURE(hostImageCopy);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(
+          VkPhysicalDeviceMultiviewPerViewViewportsFeaturesQCOM,
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_PER_VIEW_VIEWPORTS_FEATURES_QCOM);
+      {
+        CHECK_PHYS_EXT_FEATURE(multiviewPerViewViewports);
+        m_MultiviewPerViewViewports |= ext->multiviewPerViewViewports != VK_FALSE;
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceCustomResolveFeaturesEXT,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_RESOLVE_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(customResolve);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceDiagnosticsConfigFeaturesNV,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DIAGNOSTICS_CONFIG_FEATURES_NV);
+      {
+        CHECK_PHYS_EXT_FEATURE(diagnosticsConfig);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceDepthBiasControlFeaturesEXT,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_BIAS_CONTROL_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(depthBiasControl);
+        CHECK_PHYS_EXT_FEATURE(leastRepresentableValueForceUnormRepresentation);
+        CHECK_PHYS_EXT_FEATURE(floatRepresentation);
+        CHECK_PHYS_EXT_FEATURE(depthBiasExact);
+        m_DepthBiasControl = ext->depthBiasControl != VK_FALSE;
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceShaderConstantDataFeaturesKHR,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CONSTANT_DATA_FEATURES_KHR);
+      {
+        CHECK_PHYS_EXT_FEATURE(shaderConstantData);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceShaderAbortFeaturesKHR,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ABORT_FEATURES_KHR);
+      {
+        CHECK_PHYS_EXT_FEATURE(shaderAbort);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceShaderFmaFeaturesKHR,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FMA_FEATURES_KHR);
+      {
+        CHECK_PHYS_EXT_FEATURE(shaderFmaFloat16);
+        CHECK_PHYS_EXT_FEATURE(shaderFmaFloat32);
+        CHECK_PHYS_EXT_FEATURE(shaderFmaFloat64);
+
+        if(ext->shaderFmaFloat16)
+          m_PreciseFMAMask |= 16;
+        if(ext->shaderFmaFloat32)
+          m_PreciseFMAMask |= 32;
+        if(ext->shaderFmaFloat64)
+          m_PreciseFMAMask |= 64;
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(
+          VkPhysicalDeviceShaderSubgroupPartitionedFeaturesEXT,
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_PARTITIONED_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(shaderSubgroupPartitioned);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceShaderSplitBarrierFeaturesEXT,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SPLIT_BARRIER_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(shaderSplitBarrier);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceShader64BitIndexingFeaturesEXT,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_64_BIT_INDEXING_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(shader64BitIndexing);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceShaderTileImageFeaturesEXT,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_TILE_IMAGE_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(shaderTileImageColorReadAccess);
+        CHECK_PHYS_EXT_FEATURE(shaderTileImageDepthReadAccess);
+        CHECK_PHYS_EXT_FEATURE(shaderTileImageStencilReadAccess);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(
+          VkPhysicalDeviceZeroInitializeDeviceMemoryFeaturesEXT,
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ZERO_INITIALIZE_DEVICE_MEMORY_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(zeroInitializeDeviceMemory);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceImageSlicedViewOf3DFeaturesEXT,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_SLICED_VIEW_OF_3D_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(imageSlicedViewOf3D);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceExtendedFlagsFeaturesKHR,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_FLAGS_FEATURES_KHR);
+      {
+        CHECK_PHYS_EXT_FEATURE(extendedFlags);
       }
       END_PHYS_EXT_CHECK();
     }
@@ -4172,14 +4323,6 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
     createInfo.enabledLayerCount = 0;
     createInfo.ppEnabledLayerNames = NULL;
 
-    rdcarray<const char *> extArray;
-    extArray.resize(Extensions.size());
-    for(size_t i = 0; i < Extensions.size(); i++)
-      extArray[i] = Extensions[i].c_str();
-
-    createInfo.enabledExtensionCount = (uint32_t)extArray.size();
-    createInfo.ppEnabledExtensionNames = extArray.data();
-
     byte *tempMem = GetTempMemory(GetNextPatchSize(createInfo.pNext));
 
     UnwrapNextChain(m_State, "VkDeviceCreateInfo", tempMem, (VkBaseInStructure *)&createInfo);
@@ -4197,6 +4340,14 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
 
     NVAftermath_Init();
     NVAftermath_EnableVK(supportedExtensions, Extensions, &createInfo.pNext);
+
+    rdcarray<const char *> extArray;
+    extArray.resize(Extensions.size());
+    for(size_t i = 0; i < Extensions.size(); i++)
+      extArray[i] = Extensions[i].c_str();
+
+    createInfo.enabledExtensionCount = (uint32_t)extArray.size();
+    createInfo.ppEnabledExtensionNames = extArray.data();
 
     vkr = GetDeviceDispatchTable(NULL)->CreateDevice(Unwrap(physicalDevice), &createInfo, NULL,
                                                      &device);
@@ -4223,8 +4374,7 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
       return false;
     }
 
-    GetResourceManager()->WrapResource(device, device);
-    GetResourceManager()->AddLiveResource(Device, device);
+    GetResourceManager()->WrapResource(Device, device, device);
 
     AddResource(Device, ResourceType::Device, "Device");
     DerivedResource(origPhysDevice, Device);
@@ -4324,7 +4474,7 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
                                                &m_InternalCmds.cmdpool);
       CHECK_VKR(this, vkr);
 
-      GetResourceManager()->WrapResource(Unwrap(device), m_InternalCmds.cmdpool);
+      GetResourceManager()->WrapResource(ResourceId(), Unwrap(device), m_InternalCmds.cmdpool);
     }
 
     // for each queue family we've remapped to, ensure we have a command pool and command buffer on
@@ -4352,7 +4502,7 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
                                                &m_ExternalQueues[qidx].pool);
       CHECK_VKR(this, vkr);
 
-      GetResourceManager()->WrapResource(Unwrap(device), m_ExternalQueues[qidx].pool);
+      GetResourceManager()->WrapResource(ResourceId(), Unwrap(device), m_ExternalQueues[qidx].pool);
 
       VkCommandBufferAllocateInfo cmdInfo = {
           VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
@@ -4377,7 +4527,8 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
         else
           SetDispatchTableOverMagicNumber(device, m_ExternalQueues[qidx].ring[x].acquire);
 
-        GetResourceManager()->WrapResource(Unwrap(device), m_ExternalQueues[qidx].ring[x].acquire);
+        GetResourceManager()->WrapResource(ResourceId(), Unwrap(device),
+                                           m_ExternalQueues[qidx].ring[x].acquire);
 
         vkr = ObjDisp(device)->AllocateCommandBuffers(Unwrap(device), &cmdInfo,
                                                       &m_ExternalQueues[qidx].ring[x].release);
@@ -4388,25 +4539,29 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
         else
           SetDispatchTableOverMagicNumber(device, m_ExternalQueues[qidx].ring[x].release);
 
-        GetResourceManager()->WrapResource(Unwrap(device), m_ExternalQueues[qidx].ring[x].release);
+        GetResourceManager()->WrapResource(ResourceId(), Unwrap(device),
+                                           m_ExternalQueues[qidx].ring[x].release);
 
         vkr = ObjDisp(device)->CreateSemaphore(Unwrap(device), &semInfo, NULL,
                                                &m_ExternalQueues[qidx].ring[x].fromext);
         CHECK_VKR(this, vkr);
 
-        GetResourceManager()->WrapResource(Unwrap(device), m_ExternalQueues[qidx].ring[x].fromext);
+        GetResourceManager()->WrapResource(ResourceId(), Unwrap(device),
+                                           m_ExternalQueues[qidx].ring[x].fromext);
 
         vkr = ObjDisp(device)->CreateSemaphore(Unwrap(device), &semInfo, NULL,
                                                &m_ExternalQueues[qidx].ring[x].toext);
         CHECK_VKR(this, vkr);
 
-        GetResourceManager()->WrapResource(Unwrap(device), m_ExternalQueues[qidx].ring[x].toext);
+        GetResourceManager()->WrapResource(ResourceId(), Unwrap(device),
+                                           m_ExternalQueues[qidx].ring[x].toext);
 
         vkr = ObjDisp(device)->CreateFence(Unwrap(device), &fenceInfo, NULL,
                                            &m_ExternalQueues[qidx].ring[x].fence);
         CHECK_VKR(this, vkr);
 
-        GetResourceManager()->WrapResource(Unwrap(device), m_ExternalQueues[qidx].ring[x].fence);
+        GetResourceManager()->WrapResource(ResourceId(), Unwrap(device),
+                                           m_ExternalQueues[qidx].ring[x].fence);
       }
     }
 
@@ -4543,8 +4698,9 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
         tagInfo.objectType = VK_OBJECT_TYPE_INSTANCE;
         tagInfo.objectHandle = uint64_t(Unwrap(m_Instance));
         tagInfo.tagName = RENDERDOC_DescriptorsReservation_UUID;
-        tagInfo.tagSize = 0;
-        tagInfo.pTag = NULL;
+        tagInfo.tagSize = sizeof(bool);
+        bool yes = true;
+        tagInfo.pTag = &yes;
 
         vkr = ObjDisp(m_Device)->SetDebugUtilsObjectTagEXT(Unwrap(m_Device), &tagInfo);
       }
@@ -4925,7 +5081,7 @@ VkResult WrappedVulkan::vkCreateDevice(VkPhysicalDevice physicalDevice,
     RDCLOG("Created capture device from physical device %d",
            m_PhysicalDevices.indexOf(physicalDevice));
 
-    ResourceId id = GetResourceManager()->WrapResource(*pDevice, *pDevice);
+    ResourceId id = GetResourceManager()->WrapResource(ResourceId(), *pDevice, *pDevice);
 
     if(IsCaptureMode(m_State))
     {
@@ -4996,10 +5152,6 @@ VkResult WrappedVulkan::vkCreateDevice(VkPhysicalDevice physicalDevice,
 
       InitDeviceExtensionTables(*pDevice, record->instDevInfo);
     }
-    else
-    {
-      GetResourceManager()->AddLiveResource(id, *pDevice);
-    }
 
     VkDevice device = *pDevice;
 
@@ -5019,7 +5171,7 @@ VkResult WrappedVulkan::vkCreateDevice(VkPhysicalDevice physicalDevice,
                                                &m_InternalCmds.cmdpool);
       CHECK_VKR(this, vkr);
 
-      GetResourceManager()->WrapResource(Unwrap(device), m_InternalCmds.cmdpool);
+      GetResourceManager()->WrapResource(ResourceId(), Unwrap(device), m_InternalCmds.cmdpool);
     }
 
     // for each queue family that isn't our own, create a command pool and command buffer on that
@@ -5046,7 +5198,7 @@ VkResult WrappedVulkan::vkCreateDevice(VkPhysicalDevice physicalDevice,
                                                &m_ExternalQueues[qidx].pool);
       CHECK_VKR(this, vkr);
 
-      GetResourceManager()->WrapResource(Unwrap(device), m_ExternalQueues[qidx].pool);
+      GetResourceManager()->WrapResource(ResourceId(), Unwrap(device), m_ExternalQueues[qidx].pool);
 
       VkCommandBufferAllocateInfo cmdInfo = {
           VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
@@ -5071,7 +5223,8 @@ VkResult WrappedVulkan::vkCreateDevice(VkPhysicalDevice physicalDevice,
         else
           SetDispatchTableOverMagicNumber(device, m_ExternalQueues[qidx].ring[x].acquire);
 
-        GetResourceManager()->WrapResource(Unwrap(device), m_ExternalQueues[qidx].ring[x].acquire);
+        GetResourceManager()->WrapResource(ResourceId(), Unwrap(device),
+                                           m_ExternalQueues[qidx].ring[x].acquire);
 
         vkr = ObjDisp(device)->AllocateCommandBuffers(Unwrap(device), &cmdInfo,
                                                       &m_ExternalQueues[qidx].ring[x].release);
@@ -5082,25 +5235,29 @@ VkResult WrappedVulkan::vkCreateDevice(VkPhysicalDevice physicalDevice,
         else
           SetDispatchTableOverMagicNumber(device, m_ExternalQueues[qidx].ring[x].release);
 
-        GetResourceManager()->WrapResource(Unwrap(device), m_ExternalQueues[qidx].ring[x].release);
+        GetResourceManager()->WrapResource(ResourceId(), Unwrap(device),
+                                           m_ExternalQueues[qidx].ring[x].release);
 
         vkr = ObjDisp(device)->CreateSemaphore(Unwrap(device), &semInfo, NULL,
                                                &m_ExternalQueues[qidx].ring[x].fromext);
         CHECK_VKR(this, vkr);
 
-        GetResourceManager()->WrapResource(Unwrap(device), m_ExternalQueues[qidx].ring[x].fromext);
+        GetResourceManager()->WrapResource(ResourceId(), Unwrap(device),
+                                           m_ExternalQueues[qidx].ring[x].fromext);
 
         vkr = ObjDisp(device)->CreateSemaphore(Unwrap(device), &semInfo, NULL,
                                                &m_ExternalQueues[qidx].ring[x].toext);
         CHECK_VKR(this, vkr);
 
-        GetResourceManager()->WrapResource(Unwrap(device), m_ExternalQueues[qidx].ring[x].toext);
+        GetResourceManager()->WrapResource(ResourceId(), Unwrap(device),
+                                           m_ExternalQueues[qidx].ring[x].toext);
 
         vkr = ObjDisp(device)->CreateFence(Unwrap(device), &fenceInfo, NULL,
                                            &m_ExternalQueues[qidx].ring[x].fence);
         CHECK_VKR(this, vkr);
 
-        GetResourceManager()->WrapResource(Unwrap(device), m_ExternalQueues[qidx].ring[x].fence);
+        GetResourceManager()->WrapResource(ResourceId(), Unwrap(device),
+                                           m_ExternalQueues[qidx].ring[x].fence);
       }
     }
 

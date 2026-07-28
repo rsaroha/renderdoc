@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2020-2025 Baldur Karlsson
+ * Copyright (c) 2020-2026 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -1242,7 +1242,7 @@ ShaderVariable GPUOp(ThreadState &state, uint32_t instruction, const rdcarray<Id
   if(op == rdcspv::GLSLstd450::Length || op == rdcspv::GLSLstd450::Distance)
     ret.columns = 1;
 
-  state.QueueMathOp(op, paramVars, ret);
+  state.QueueMathOp(rdcspv::Op::ExtInst, op, paramVars, ret);
 
   return ret;
 }

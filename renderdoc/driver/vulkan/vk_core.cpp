@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2025 Baldur Karlsson
+ * Copyright (c) 2015-2026 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -45,6 +45,17 @@ RDOC_EXTERN_CONFIG(bool, Vulkan_Debug_VerboseCommandRecording);
 RDOC_DEBUG_CONFIG(bool, Vulkan_Debug_SingleSubmitFlushing, false,
                   "Every command buffer is submitted and fully flushed to the GPU, to narrow down "
                   "the source of problems.");
+
+static rdcarray<int> ShaderStagesForAction(const ActionFlags flags)
+{
+  if(flags & ActionFlags::Dispatch)
+    return {5};
+  else if(flags & ActionFlags::Drawcall)
+    return {0, 1, 2, 3, 4};
+  else if(flags & ActionFlags::MeshDispatch)
+    return {4, 6, 7};
+  return {};
+}
 
 uint64_t VkInitParams::GetSerialiseSize()
 {
@@ -190,7 +201,6 @@ WrappedVulkan::WrappedVulkan()
   debugMessageSinkTLSSlot = Threading::AllocateTLSSlot();
 
   m_RootEventID = 1;
-  m_RootActionID = 1;
   m_FirstEventID = 0;
   m_LastEventID = ~0U;
 
@@ -198,11 +208,8 @@ WrappedVulkan::WrappedVulkan()
   m_SubmitChain = NULL;
 
   m_CurChunkOffset = 0;
-  m_AddedAction = false;
 
   m_LastCmdBufferID = ResourceId();
-
-  m_ActionStack.push_back(&m_ParentAction);
 
   m_SetDeviceLoaderData = NULL;
 
@@ -243,6 +250,13 @@ WrappedVulkan::~WrappedVulkan()
 
   if(VkMarkerRegion::vk == this)
     VkMarkerRegion::vk = NULL;
+
+  for(auto it = m_Annotations.begin(); it != m_Annotations.end(); ++it)
+    delete it->second;
+  for(SDObject *o : m_EventAnnotations)
+    delete o;
+
+  delete m_RootAnnotation;
 
   SAFE_DELETE(m_StoredStructuredData);
 
@@ -355,7 +369,7 @@ VkCommandBuffer WrappedVulkan::GetNextCmd()
       else
         SetDispatchTableOverMagicNumber(m_Device, ret);
 
-      GetResourceManager()->WrapResource(Unwrap(m_Device), ret);
+      GetResourceManager()->WrapResource(ResourceId(), Unwrap(m_Device), ret);
     }
     else
     {
@@ -448,7 +462,7 @@ VkSemaphore WrappedVulkan::GetNextSemaphore()
     VkResult vkr = ObjDisp(m_Device)->CreateSemaphore(Unwrap(m_Device), &semInfo, NULL, &ret);
     CHECK_VKR(this, vkr);
 
-    GetResourceManager()->WrapResource(Unwrap(m_Device), ret);
+    GetResourceManager()->WrapResource(ResourceId(), Unwrap(m_Device), ret);
   }
 
   m_InternalCmds.pendingsems.push_back(ret);
@@ -481,6 +495,14 @@ void WrappedVulkan::FlushQ()
   // CPU-GPU sync or whether it is just looking to recycle command buffers
   // (Particularly the one in vkQueuePresentKHR drawing the overlay)
 
+  // if there are multiple queue submissions in flight, wait for the previous queue to finish
+  if(m_PrevQueue != m_Queue)
+  {
+    if(m_PrevQueue != VK_NULL_HANDLE)
+      ObjDisp(m_PrevQueue)->QueueWaitIdle(Unwrap(m_PrevQueue));
+    m_PrevQueue = VK_NULL_HANDLE;
+  }
+
   // see comment in SubmitQ()
   if(m_Queue != VK_NULL_HANDLE)
   {
@@ -509,6 +531,17 @@ void WrappedVulkan::FlushQ()
   {
     m_InternalCmds.freesems.append(m_InternalCmds.submittedsems);
     m_InternalCmds.submittedsems.clear();
+  }
+}
+
+void WrappedVulkan::ReloadShaderDebugInformation()
+{
+  // Reload the shader module debug information
+  for(auto it = m_CreationInfo.m_ShaderModule.begin(); it != m_CreationInfo.m_ShaderModule.end(); ++it)
+  {
+    if(ResourceIDGen::IsReplayOnlyID(it->first))
+      continue;
+    it->second.Reload(m_ResourceManager, m_CreationInfo, it->first);
   }
 }
 
@@ -1093,6 +1126,12 @@ static const VkExtensionProperties supportedExtensions[] = {
         VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME,
         VK_EXT_CUSTOM_BORDER_COLOR_SPEC_VERSION,
     },
+#ifdef VK_EXT_custom_resolve
+    {
+        VK_EXT_CUSTOM_RESOLVE_EXTENSION_NAME,
+        VK_EXT_CUSTOM_RESOLVE_SPEC_VERSION,
+    },
+#endif
     {
         VK_EXT_DEBUG_MARKER_EXTENSION_NAME,
         VK_EXT_DEBUG_MARKER_SPEC_VERSION,
@@ -1104,6 +1143,10 @@ static const VkExtensionProperties supportedExtensions[] = {
     {
         VK_EXT_DEBUG_UTILS_EXTENSION_NAME,
         VK_EXT_DEBUG_UTILS_SPEC_VERSION,
+    },
+    {
+        VK_EXT_DEPTH_BIAS_CONTROL_EXTENSION_NAME,
+        VK_EXT_DEPTH_BIAS_CONTROL_SPEC_VERSION,
     },
     {
         VK_EXT_DEPTH_CLAMP_ZERO_ONE_EXTENSION_NAME,
@@ -1232,8 +1275,16 @@ static const VkExtensionProperties supportedExtensions[] = {
         VK_EXT_IMAGE_COMPRESSION_CONTROL_SWAPCHAIN_SPEC_VERSION,
     },
     {
+        VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME,
+        VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_SPEC_VERSION,
+    },
+    {
         VK_EXT_IMAGE_ROBUSTNESS_EXTENSION_NAME,
         VK_EXT_IMAGE_ROBUSTNESS_SPEC_VERSION,
+    },
+    {
+        VK_EXT_IMAGE_SLICED_VIEW_OF_3D_EXTENSION_NAME,
+        VK_EXT_IMAGE_SLICED_VIEW_OF_3D_SPEC_VERSION,
     },
     {
         VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME,
@@ -1246,6 +1297,10 @@ static const VkExtensionProperties supportedExtensions[] = {
     {
         VK_EXT_INLINE_UNIFORM_BLOCK_EXTENSION_NAME,
         VK_EXT_INLINE_UNIFORM_BLOCK_SPEC_VERSION,
+    },
+    {
+        VK_EXT_LAYER_SETTINGS_EXTENSION_NAME,
+        VK_EXT_LAYER_SETTINGS_SPEC_VERSION,
     },
     {
         VK_EXT_LINE_RASTERIZATION_EXTENSION_NAME,
@@ -1298,6 +1353,10 @@ static const VkExtensionProperties supportedExtensions[] = {
         VK_EXT_PCI_BUS_INFO_SPEC_VERSION,
     },
     {
+        VK_EXT_PHYSICAL_DEVICE_DRM_EXTENSION_NAME,
+        VK_EXT_PHYSICAL_DEVICE_DRM_SPEC_VERSION,
+    },
+    {
         VK_EXT_PIPELINE_CREATION_CACHE_CONTROL_EXTENSION_NAME,
         VK_EXT_PIPELINE_CREATION_CACHE_CONTROL_SPEC_VERSION,
     },
@@ -1320,6 +1379,10 @@ static const VkExtensionProperties supportedExtensions[] = {
     {
         VK_EXT_PRESENT_MODE_FIFO_LATEST_READY_EXTENSION_NAME,
         VK_EXT_PRESENT_MODE_FIFO_LATEST_READY_SPEC_VERSION,
+    },
+    {
+        VK_EXT_PRESENT_TIMING_EXTENSION_NAME,
+        VK_EXT_PRESENT_TIMING_SPEC_VERSION,
     },
     {
         VK_EXT_PRIMITIVE_TOPOLOGY_LIST_RESTART_EXTENSION_NAME,
@@ -1346,6 +1409,10 @@ static const VkExtensionProperties supportedExtensions[] = {
         VK_EXT_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_SPEC_VERSION,
     },
     {
+        VK_EXT_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME,
+        VK_EXT_RAY_TRACING_INVOCATION_REORDER_SPEC_VERSION,
+    },
+    {
         VK_EXT_RGBA10X6_FORMATS_EXTENSION_NAME,
         VK_EXT_RGBA10X6_FORMATS_SPEC_VERSION,
     },
@@ -1370,6 +1437,10 @@ static const VkExtensionProperties supportedExtensions[] = {
         VK_EXT_SEPARATE_STENCIL_USAGE_SPEC_VERSION,
     },
     {
+        VK_EXT_SHADER_64BIT_INDEXING_EXTENSION_NAME,
+        VK_EXT_SHADER_64BIT_INDEXING_SPEC_VERSION,
+    },
+    {
         VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME,
         VK_EXT_SHADER_ATOMIC_FLOAT_SPEC_VERSION,
     },
@@ -1390,6 +1461,10 @@ static const VkExtensionProperties supportedExtensions[] = {
         VK_EXT_SHADER_OBJECT_SPEC_VERSION,
     },
     {
+        VK_EXT_SHADER_SPLIT_BARRIER_EXTENSION_NAME,
+        VK_EXT_SHADER_SPLIT_BARRIER_SPEC_VERSION,
+    },
+    {
         VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME,
         VK_EXT_SHADER_STENCIL_EXPORT_SPEC_VERSION,
     },
@@ -1398,8 +1473,16 @@ static const VkExtensionProperties supportedExtensions[] = {
         VK_EXT_SHADER_SUBGROUP_BALLOT_SPEC_VERSION,
     },
     {
+        VK_EXT_SHADER_SUBGROUP_PARTITIONED_EXTENSION_NAME,
+        VK_EXT_SHADER_SUBGROUP_PARTITIONED_SPEC_VERSION,
+    },
+    {
         VK_EXT_SHADER_SUBGROUP_VOTE_EXTENSION_NAME,
         VK_EXT_SHADER_SUBGROUP_VOTE_SPEC_VERSION,
+    },
+    {
+        VK_EXT_SHADER_TILE_IMAGE_EXTENSION_NAME,
+        VK_EXT_SHADER_TILE_IMAGE_SPEC_VERSION,
     },
     {
         VK_EXT_SHADER_VIEWPORT_INDEX_LAYER_EXTENSION_NAME,
@@ -1468,6 +1551,10 @@ static const VkExtensionProperties supportedExtensions[] = {
     {
         VK_EXT_YCBCR_IMAGE_ARRAYS_EXTENSION_NAME,
         VK_EXT_YCBCR_IMAGE_ARRAYS_SPEC_VERSION,
+    },
+    {
+        VK_EXT_ZERO_INITIALIZE_DEVICE_MEMORY_EXTENSION_NAME,
+        VK_EXT_ZERO_INITIALIZE_DEVICE_MEMORY_SPEC_VERSION,
     },
     {
         VK_GOOGLE_DECORATE_STRING_EXTENSION_NAME,
@@ -1594,6 +1681,10 @@ static const VkExtensionProperties supportedExtensions[] = {
     {
         VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME,
         VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_SPEC_VERSION,
+    },
+    {
+        VK_KHR_EXTENDED_FLAGS_EXTENSION_NAME,
+        VK_KHR_EXTENDED_FLAGS_SPEC_VERSION,
     },
     {
         VK_KHR_EXTERNAL_FENCE_EXTENSION_NAME,
@@ -1822,6 +1913,10 @@ static const VkExtensionProperties supportedExtensions[] = {
         VK_KHR_SEPARATE_DEPTH_STENCIL_LAYOUTS_SPEC_VERSION,
     },
     {
+        VK_KHR_SHADER_ABORT_EXTENSION_NAME,
+        VK_KHR_SHADER_ABORT_SPEC_VERSION,
+    },
+    {
         VK_KHR_SHADER_ATOMIC_INT64_EXTENSION_NAME,
         VK_KHR_SHADER_ATOMIC_INT64_SPEC_VERSION,
     },
@@ -1832,6 +1927,10 @@ static const VkExtensionProperties supportedExtensions[] = {
     {
         VK_KHR_SHADER_CLOCK_EXTENSION_NAME,
         VK_KHR_SHADER_CLOCK_SPEC_VERSION,
+    },
+    {
+        VK_KHR_SHADER_CONSTANT_DATA_EXTENSION_NAME,
+        VK_KHR_SHADER_CONSTANT_DATA_SPEC_VERSION,
     },
     {
         VK_KHR_SHADER_DRAW_PARAMETERS_EXTENSION_NAME,
@@ -1852,6 +1951,10 @@ static const VkExtensionProperties supportedExtensions[] = {
     {
         VK_KHR_SHADER_FLOAT_CONTROLS_2_EXTENSION_NAME,
         VK_KHR_SHADER_FLOAT_CONTROLS_2_SPEC_VERSION,
+    },
+    {
+        VK_KHR_SHADER_FMA_EXTENSION_NAME,
+        VK_KHR_SHADER_FMA_SPEC_VERSION,
     },
     {
         VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME,
@@ -2006,6 +2109,14 @@ static const VkExtensionProperties supportedExtensions[] = {
         VK_NV_DEDICATED_ALLOCATION_SPEC_VERSION,
     },
     {
+        VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME,
+        VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_SPEC_VERSION,
+    },
+    {
+        VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME,
+        VK_NV_DEVICE_DIAGNOSTICS_CONFIG_SPEC_VERSION,
+    },
+    {
         VK_NV_EXTERNAL_MEMORY_EXTENSION_NAME,
         VK_NV_EXTERNAL_MEMORY_SPEC_VERSION,
     },
@@ -2026,6 +2137,10 @@ static const VkExtensionProperties supportedExtensions[] = {
     {
         VK_NV_GEOMETRY_SHADER_PASSTHROUGH_EXTENSION_NAME,
         VK_NV_GEOMETRY_SHADER_PASSTHROUGH_SPEC_VERSION,
+    },
+    {
+        VK_NV_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME,
+        VK_NV_RAY_TRACING_INVOCATION_REORDER_SPEC_VERSION,
     },
     {
         VK_NV_SAMPLE_MASK_OVERRIDE_COVERAGE_EXTENSION_NAME,
@@ -2052,6 +2167,10 @@ static const VkExtensionProperties supportedExtensions[] = {
     {
         VK_QCOM_FRAGMENT_DENSITY_MAP_OFFSET_EXTENSION_NAME,
         VK_QCOM_FRAGMENT_DENSITY_MAP_OFFSET_SPEC_VERSION,
+    },
+    {
+        VK_QCOM_MULTIVIEW_PER_VIEW_VIEWPORTS_EXTENSION_NAME,
+        VK_QCOM_MULTIVIEW_PER_VIEW_VIEWPORTS_SPEC_VERSION,
     },
     {
         VK_QCOM_RENDER_PASS_SHADER_RESOLVE_EXTENSION_NAME,
@@ -2599,6 +2718,39 @@ bool WrappedVulkan::Serialise_BeginCaptureFrame(SerialiserType &ser)
 
   GetResourceManager()->SerialiseImageStates(ser, m_ImageStates);
 
+  if(ser.VersionAtLeast(0x19))
+  {
+    SCOPED_LOCK(m_AnnotationsLock);
+
+    SERIALISE_ELEMENT_LOCAL(numAnnotations, uint32_t(m_Annotations.size()));
+
+    auto it = m_Annotations.begin();
+    for(uint32_t i = 0; i < numAnnotations; i++)
+    {
+      SERIALISE_ELEMENT_LOCAL(id, it->first);
+      SDObject *annotation = NULL;
+      if(ser.IsReading())
+      {
+        annotation = new SDObject(""_lit, ""_lit);    // will be overwritten below
+      }
+      else
+      {
+        annotation = it->second;
+        it++;
+      }
+      ser.Serialise("annotation"_lit, *annotation);
+
+      if(ser.IsReading() && IsLoading(m_State))
+      {
+        m_Annotations[id] = annotation;
+        m_Replay->GetResourceDesc(id).annotations = annotation;
+      }
+    }
+
+    if(numAnnotations > 0)
+      m_Replay->WriteFrameRecord().frameInfo.containsAnnotations = true;
+  }
+
   SERIALISE_CHECK_READ_ERRORS();
 
   return true;
@@ -2716,14 +2868,19 @@ void WrappedVulkan::StartFrameCapture(DeviceOwnedWindow devWnd)
   // way of knowing how it's used
   for(auto it = forced.begin(); it != forced.end(); ++it)
   {
-    // reference the buffer/image
+    // reference the resource
     GetResourceManager()->MarkResourceFrameReferenced((*it)->GetResourceID(), eFrameRef_Read);
-    // and its backing memory
-    GetResourceManager()->MarkMemoryFrameReferenced((*it)->baseResourceMem, (*it)->memOffset,
-                                                    (*it)->memSize, eFrameRef_ReadBeforeWrite);
-    // and sparse memory (yuck yuck yuck)
-    if(((*it)->resType == eResBuffer || (*it)->resType == eResImage) && (*it)->resInfo)
-      GetResourceManager()->MarkSparseMapReferenced((*it)->resInfo);
+    // and backing memory for buffers
+    if((*it)->resType == eResBuffer)
+    {
+      ResourceId mem = (*it)->baseResourceMem;
+      if(mem != ResourceId())
+        GetResourceManager()->MarkMemoryFrameReferenced(mem, (*it)->memOffset, (*it)->memSize,
+                                                        eFrameRef_ReadBeforeWrite);
+      // and sparse memory (yuck yuck yuck)
+      if((*it)->resInfo)
+        GetResourceManager()->MarkSparseMapReferenced((*it)->resInfo);
+    }
   }
 }
 
@@ -2821,7 +2978,7 @@ bool WrappedVulkan::EndFrameCapture(DeviceOwnedWindow devWnd)
     else if(VRBackbufferRecord)
     {
       RDCASSERT(VRBackbufferRecord->resInfo);
-      backbuffer = GetResourceManager()->GetCurrentHandle<VkImage>(m_CurrentVRBackbuffer);
+      backbuffer = GetResourceManager()->GetHandle<VkImage>(m_CurrentVRBackbuffer);
       swapImageInfo = &VRBackbufferRecord->resInfo->imageInfo;
       swapQueueIndex = m_QueueFamilyIdx;
       swapLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -2834,6 +2991,10 @@ bool WrappedVulkan::EndFrameCapture(DeviceOwnedWindow devWnd)
   rdcarray<VkBuffer> DeadBuffers;
   rdcarray<VkImage> DeadImages;
   rdcarray<VkImageView> DeadImageViews;
+  rdcarray<VkDeviceMemory> DeadInternalMemories;
+  rdcarray<VkImage> DeadInternalImages;
+  rdcarray<VkImageView> DeadInternalImageViews;
+  rdcarray<ResourceId> DeadImageStates;
 
   // transition back to IDLE atomically
   {
@@ -2857,25 +3018,18 @@ bool WrappedVulkan::EndFrameCapture(DeviceOwnedWindow devWnd)
     }
 
     {
-      SCOPED_LOCK(m_DeviceAddressResourcesLock);
-      DeadMemories.swap(m_DeviceAddressResources.DeadMemories);
-      DeadBuffers.swap(m_DeviceAddressResources.DeadBuffers);
-      DeadImages.swap(m_DeviceAddressResources.DeadImages);
-      DeadImageViews.swap(m_DeviceAddressResources.DeadImageViews);
+      SCOPED_LOCK(m_DeferredDestructLock);
+      DeadMemories.swap(m_DeferredDestructResources.DeadMemories);
+      DeadBuffers.swap(m_DeferredDestructResources.DeadBuffers);
+      DeadImages.swap(m_DeferredDestructResources.DeadImages);
+      DeadImageViews.swap(m_DeferredDestructResources.DeadImageViews);
+      DeadImageStates.swap(m_DeferredDestructResources.DeadImageStates);
+
+      DeadInternalMemories.swap(m_InternalDeferredDestructResources.DeadMemories);
+      DeadInternalImages.swap(m_InternalDeferredDestructResources.DeadImages);
+      DeadInternalImageViews.swap(m_InternalDeferredDestructResources.DeadImageViews);
     }
   }
-
-  for(VkDeviceMemory m : DeadMemories)
-    vkFreeMemory(m_Device, m, NULL);
-
-  for(VkBuffer b : DeadBuffers)
-    vkDestroyBuffer(m_Device, b, NULL);
-
-  for(VkImage i : DeadImages)
-    vkDestroyImage(m_Device, i, NULL);
-
-  for(VkImageView v : DeadImageViews)
-    vkDestroyImageView(m_Device, v, NULL);
 
   // gather backbuffer screenshot
   const uint32_t maxSize = 2048;
@@ -2909,7 +3063,7 @@ bool WrappedVulkan::EndFrameCapture(DeviceOwnedWindow devWnd)
     vt->CreateBuffer(Unwrap(device), &bufInfo, NULL, &readbackBuf);
     CHECK_VKR(this, vkr);
 
-    GetResourceManager()->WrapResource(Unwrap(device), readbackBuf);
+    GetResourceManager()->WrapResource(ResourceId(), Unwrap(device), readbackBuf);
 
     MemoryAllocation readbackMem =
         AllocateMemoryForResource(readbackBuf, MemoryScope::InitialContents, MemoryType::Readback);
@@ -3093,6 +3247,36 @@ bool WrappedVulkan::EndFrameCapture(DeviceOwnedWindow devWnd)
 
   uint64_t captureSectionSize = 0;
 
+  // any images that were pre-initialized need to reference their device memory to ensure it has
+  // proper initial contents. This is not referenced any other way because normally images don't
+  // mark references into the memory as they're usually independent, but pre-initialized images
+  // can't be saved as normal initial contents (because we can't transition them to copy from them)
+  // so they must be snapshotted on replay which requires proper memory contents underneath.
+  //
+  // this only applies to images that are in PREINITIALIZED at capture start
+  {
+    for(auto it = m_ImageStates.begin(); it != m_ImageStates.end(); ++it)
+    {
+      LockedConstImageStateRef lockedState = it->second.LockRead();
+
+      if(lockedState->GetImageInfo().initialLayout == VK_IMAGE_LAYOUT_PREINITIALIZED)
+      {
+        for(auto subit = lockedState->subresourceStates.begin();
+            subit != lockedState->subresourceStates.end(); ++subit)
+        {
+          if(subit->state().oldLayout == VK_IMAGE_LAYOUT_PREINITIALIZED ||
+             subit->state().newLayout == UNKNOWN_PREV_IMG_LAYOUT)
+          {
+            GetResourceManager()->MarkMemoryFrameReferenced(
+                lockedState->boundMemory, lockedState->boundMemoryOffset,
+                lockedState->boundMemorySize, eFrameRef_Read);
+            break;
+          }
+        }
+      }
+    }
+  }
+
   {
     WriteSerialiser ser(captureWriter, Ownership::Stream);
 
@@ -3225,6 +3409,39 @@ bool WrappedVulkan::EndFrameCapture(DeviceOwnedWindow devWnd)
 
   GetResourceManager()->FreeInitialContents();
 
+  for(VkDeviceMemory m : DeadMemories)
+    vkFreeMemory(m_Device, m, NULL);
+
+  for(VkBuffer b : DeadBuffers)
+    vkDestroyBuffer(m_Device, b, NULL);
+
+  for(VkImage i : DeadImages)
+    vkDestroyImage(m_Device, i, NULL);
+
+  for(VkImageView v : DeadImageViews)
+    vkDestroyImageView(m_Device, v, NULL);
+
+  for(ResourceId id : DeadImageStates)
+    EraseImageState(id);
+
+  for(VkDeviceMemory m : DeadInternalMemories)
+  {
+    ObjDisp(m_Device)->FreeMemory(Unwrap(m_Device), Unwrap(m), NULL);
+    GetResourceManager()->ReleaseWrappedResource(m, true);
+  }
+
+  for(VkImage i : DeadInternalImages)
+  {
+    ObjDisp(m_Device)->DestroyImage(Unwrap(m_Device), Unwrap(i), NULL);
+    GetResourceManager()->ReleaseWrappedResource(i, true);
+  }
+
+  for(VkImageView v : DeadInternalImageViews)
+  {
+    ObjDisp(m_Device)->DestroyImageView(Unwrap(m_Device), Unwrap(v), NULL);
+    GetResourceManager()->ReleaseWrappedResource(v, true);
+  }
+
   FreeAllMemory(MemoryScope::InitialContents);
   for(rdcstr &fn : m_InitTempFiles)
     FileIO::Delete(fn);
@@ -3250,6 +3467,9 @@ bool WrappedVulkan::DiscardFrameCapture(DeviceOwnedWindow devWnd)
   rdcarray<VkBuffer> DeadBuffers;
   rdcarray<VkImage> DeadImages;
   rdcarray<VkImageView> DeadImageViews;
+  rdcarray<VkDeviceMemory> DeadInternalMemories;
+  rdcarray<VkImage> DeadInternalImages;
+  rdcarray<VkImageView> DeadInternalImageViews;
 
   // transition back to IDLE atomically
   {
@@ -3272,11 +3492,14 @@ bool WrappedVulkan::DiscardFrameCapture(DeviceOwnedWindow devWnd)
     }
 
     {
-      SCOPED_LOCK(m_DeviceAddressResourcesLock);
-      DeadMemories.swap(m_DeviceAddressResources.DeadMemories);
-      DeadBuffers.swap(m_DeviceAddressResources.DeadBuffers);
-      DeadImages.swap(m_DeviceAddressResources.DeadImages);
-      DeadImageViews.swap(m_DeviceAddressResources.DeadImageViews);
+      SCOPED_LOCK(m_DeferredDestructLock);
+      DeadMemories.swap(m_DeferredDestructResources.DeadMemories);
+      DeadBuffers.swap(m_DeferredDestructResources.DeadBuffers);
+      DeadImages.swap(m_DeferredDestructResources.DeadImages);
+      DeadImageViews.swap(m_DeferredDestructResources.DeadImageViews);
+      DeadInternalMemories.swap(m_InternalDeferredDestructResources.DeadMemories);
+      DeadInternalImages.swap(m_InternalDeferredDestructResources.DeadImages);
+      DeadInternalImageViews.swap(m_InternalDeferredDestructResources.DeadImageViews);
     }
   }
 
@@ -3291,6 +3514,24 @@ bool WrappedVulkan::DiscardFrameCapture(DeviceOwnedWindow devWnd)
 
   for(VkImageView v : DeadImageViews)
     vkDestroyImageView(m_Device, v, NULL);
+
+  for(VkDeviceMemory m : DeadInternalMemories)
+  {
+    ObjDisp(m_Device)->FreeMemory(Unwrap(m_Device), Unwrap(m), NULL);
+    GetResourceManager()->ReleaseWrappedResource(m, true);
+  }
+
+  for(VkImage i : DeadInternalImages)
+  {
+    ObjDisp(m_Device)->DestroyImage(Unwrap(m_Device), Unwrap(i), NULL);
+    GetResourceManager()->ReleaseWrappedResource(i, true);
+  }
+
+  for(VkImageView v : DeadInternalImageViews)
+  {
+    ObjDisp(m_Device)->DestroyImageView(Unwrap(m_Device), Unwrap(v), NULL);
+    GetResourceManager()->ReleaseWrappedResource(v, true);
+  }
 
   Atomic::Inc32(&m_ReuseEnabled);
 
@@ -3408,7 +3649,7 @@ void WrappedVulkan::AddResource(ResourceId id, ResourceType type, const char *de
 
 void WrappedVulkan::DerivedResource(ResourceId parentLive, ResourceId child)
 {
-  ResourceId parentId = GetResourceManager()->GetOriginalID(parentLive);
+  ResourceId parentId = parentLive;
 
   if(GetReplay()->GetResourceDesc(parentId).derivedResources.contains(child))
     return;
@@ -3589,8 +3830,8 @@ RDResult WrappedVulkan::ReadLogInitialisation(RDCFile *rdc, bool storeStructured
         {
           ObjDisp(m_Device)->GetDeviceQueue(Unwrap(m_Device), m_QueueFamilyIdx, 0, &m_Queue);
 
-          GetResourceManager()->WrapResource(Unwrap(m_Device), m_Queue);
-          GetResourceManager()->AddLiveResource(ResourceIDGen::GetNewUniqueID(), m_Queue);
+          ResourceId id = ResourceIDGen::GetNewUniqueID();
+          GetResourceManager()->WrapResource(id, Unwrap(m_Device), m_Queue);
 
           m_ExternalQueues[m_QueueFamilyIdx].queue = m_Queue;
         }
@@ -3673,10 +3914,22 @@ RDResult WrappedVulkan::ReadLogInitialisation(RDCFile *rdc, bool storeStructured
                             GPUBuffer::eGPUBufferGPULocal | GPUBuffer::eGPUBufferIndirectBuffer);
     m_IndirectBuffer.Name("m_IndirectBuffer");
 
+    m_IndirectBufferCB.Create(this, GetDev(), m_IndirectBufferSize * 2, 1,
+                              GPUBuffer::eGPUBufferGPULocal | GPUBuffer::eGPUBufferIndirectBuffer);
+    m_IndirectBufferCB.Name("m_IndirectBufferActionCB");
+
     m_IndirectCommandBuffer = GetNextCmd();
 
     // steal the command buffer out of the pending commands - we'll manage its lifetime ourselves
     m_InternalCmds.pendingcmds.pop_back();
+
+    for(const rdcpair<VkCommandPool, VkCommandBuffer> &rerecord : m_RerecordCmdList)
+    {
+      m_commandQueueFamilies.erase(GetResID(rerecord.second));
+      vkFreeCommandBuffers(GetDev(), rerecord.first, 1, &rerecord.second);
+    }
+
+    m_RerecordCmdList.clear();
   }
 
   FreeAllMemory(MemoryScope::IndirectReadback);
@@ -3766,10 +4019,10 @@ RDResult WrappedVulkan::ContextReplayLog(CaptureState readType, uint32_t startEv
         VkDebugUtilsObjectNameInfoEXT name = {VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT};
         name.pObjectName = it->second.c_str();
 
-        if(!GetResourceManager()->HasCurrentResource(it->first))
+        if(!GetResourceManager()->HasResource(it->first))
           continue;
 
-        WrappedVkRes *res = GetResourceManager()->GetCurrentResource(it->first);
+        WrappedVkRes *res = GetResourceManager()->GetResource(it->first);
 
         if(res)
         {
@@ -3836,8 +4089,6 @@ RDResult WrappedVulkan::ContextReplayLog(CaptureState readType, uint32_t startEv
     SetDebugMessageSink(sink);
   }
 
-  m_RootEvents.clear();
-
   if(IsActiveReplaying(m_State))
   {
     APIEvent ev = GetEvent(startEventID);
@@ -3861,7 +4112,6 @@ RDResult WrappedVulkan::ContextReplayLog(CaptureState readType, uint32_t startEv
   else
   {
     m_RootEventID = 1;
-    m_RootActionID = 1;
     m_FirstEventID = 0;
     m_LastEventID = ~0U;
   }
@@ -3950,7 +4200,8 @@ RDResult WrappedVulkan::ContextReplayLog(CaptureState readType, uint32_t startEv
     // boundaries, the event IDs would no longer match up).
     if(m_LastCmdBufferID == ResourceId() || startEventID > 1)
     {
-      m_RootEventID++;
+      if(chunktype != VulkanChunk::SetQueueAnnotation)
+        m_RootEventID++;
 
       if(startEventID > 1)
         ser.GetReader()->SetOffset(GetEvent(m_RootEventID).fileOffset);
@@ -3959,7 +4210,8 @@ RDResult WrappedVulkan::ContextReplayLog(CaptureState readType, uint32_t startEv
     {
       // these events are completely omitted, so don't increment the curEventID
       if(chunktype != VulkanChunk::vkBeginCommandBuffer &&
-         chunktype != VulkanChunk::vkEndCommandBuffer)
+         chunktype != VulkanChunk::vkEndCommandBuffer &&
+         chunktype != VulkanChunk::SetCommandAnnotation)
         m_BakedCmdBufferInfo[m_LastCmdBufferID].curEventID++;
     }
   }
@@ -3968,7 +4220,11 @@ RDResult WrappedVulkan::ContextReplayLog(CaptureState readType, uint32_t startEv
     AddFrameTerminator(AMDRGPControl::GetEndTag());
 
   // Save the current render state in the partial command buffer.
-  m_RenderState = m_BakedCmdBufferInfo[GetPartialCommandBuffer()].state;
+  ResourceId cmdBuf = GetPartialCommandBuffer();
+  if(cmdBuf != ResourceId())
+    m_RenderState = m_BakedCmdBufferInfo[cmdBuf].state;
+  else
+    m_RenderState = VulkanRenderState();
 
   // swap the structure back now that we've accumulated the frame as well.
   if(IsLoading(m_State) || IsStructuredExporting(m_State))
@@ -3978,11 +4234,10 @@ RDResult WrappedVulkan::ContextReplayLog(CaptureState readType, uint32_t startEv
 
   if(IsLoading(m_State))
   {
-    GetReplay()->WriteFrameRecord().actionList = m_ParentAction.Bake();
-
+    ActionDescription rootAction;
+    BakeEventNodes(rootAction);
+    rootAction.children.swap(GetReplay()->WriteFrameRecord().actionList);
     SetupActionPointers(m_Actions, GetReplay()->WriteFrameRecord().actionList);
-
-    m_ParentAction.children.clear();
   }
 
   // submit the indirect preparation command buffer, if we need to
@@ -4034,8 +4289,8 @@ void WrappedVulkan::ApplyInitialContents()
 
     ObjDisp(m_Device)->GetDeviceQueue(Unwrap(m_Device), (uint32_t)i, 0, &queue);
 
-    GetResourceManager()->WrapResource(Unwrap(m_Device), queue);
-    GetResourceManager()->AddLiveResource(ResourceIDGen::GetNewUniqueID(), queue);
+    ResourceId id = ResourceIDGen::GetNewUniqueID();
+    GetResourceManager()->WrapResource(id, Unwrap(m_Device), queue);
 
     m_ExternalQueues[i].queue = queue;
   }
@@ -4087,7 +4342,7 @@ void WrappedVulkan::ApplyInitialContents()
 
   for(auto it = m_ImageStates.begin(); it != m_ImageStates.end(); ++it)
   {
-    if(GetResourceManager()->HasCurrentResource(it->first))
+    if(GetResourceManager()->HasResource(it->first))
     {
       it->second.LockWrite()->ResetToOldState(m_cleanupImageBarriers, GetImageTransitionInfo());
     }
@@ -4195,7 +4450,11 @@ void WrappedVulkan::ApplyInitialContents()
 
 bool WrappedVulkan::ContextProcessChunk(ReadSerialiser &ser, VulkanChunk chunk)
 {
-  m_AddedAction = false;
+  if(IsLoading(m_State))
+  {
+    m_AddedEventNode = false;
+    m_LoadingEventNode = VulkanEventNode();
+  }
 
   bool success = ProcessChunk(ser, chunk);
 
@@ -4212,14 +4471,15 @@ bool WrappedVulkan::ContextProcessChunk(ReadSerialiser &ser, VulkanChunk chunk)
     {
       // also ignore, this just pops the action stack
     }
+    else if(chunk == VulkanChunk::SetCommandAnnotation || chunk == VulkanChunk::SetQueueAnnotation)
+    {
+    }
     else
     {
-      if(!m_AddedAction)
+      if(!m_AddedEventNode)
         AddEvent();
     }
   }
-
-  m_AddedAction = false;
 
   return true;
 }
@@ -4232,7 +4492,7 @@ void WrappedVulkan::CopyInternalDescriptor(VkCommandBuffer unwrappedCmdBuf, VkBu
 
   for(ResourceId id : m_ResourceDescBuffers)
   {
-    VkBuffer dst = Unwrap(GetResourceManager()->GetCurrentHandle<VkBuffer>(id));
+    VkBuffer dst = Unwrap(GetResourceManager()->GetHandle<VkBuffer>(id));
     bufCopy.dstOffset = m_CreationInfo.m_Buffer[id].size;
 
     ObjDisp(m_Device)->CmdCopyBuffer(unwrappedCmdBuf, unwrappedSrc, dst, 1, &bufCopy);
@@ -4794,6 +5054,21 @@ bool WrappedVulkan::ProcessChunk(ReadSerialiser &ser, VulkanChunk chunk)
       return Serialise_vkCmdPushDescriptorSet2(ser, VK_NULL_HANDLE, NULL);
     case VulkanChunk::vkCmdPushDescriptorSetWithTemplate2:
       return Serialise_vkCmdPushDescriptorSetWithTemplate2(ser, VK_NULL_HANDLE, NULL);
+    case VulkanChunk::vkCmdBeginCustomResolveEXT:
+      return Serialise_vkCmdBeginCustomResolveEXT(ser, VK_NULL_HANDLE, NULL);
+
+    case VulkanChunk::SetQueueAnnotation:
+      return Serialise_SetQueueAnnotation(ser, VK_NULL_HANDLE, rdcstr(), eRENDERDOC_AnnotationMax,
+                                          0, RENDERDOC_AnnotationValue());
+    case VulkanChunk::SetCommandAnnotation:
+      return Serialise_SetCommandAnnotation(ser, VK_NULL_HANDLE, rdcstr(), eRENDERDOC_AnnotationMax,
+                                            0, RENDERDOC_AnnotationValue());
+
+    case VulkanChunk::vkCmdSetCheckpointNV:
+      return Serialise_vkCmdSetCheckpointNV(ser, VK_NULL_HANDLE, NULL);
+
+    case VulkanChunk::vkCmdSetDepthBias2EXT:
+      return Serialise_vkCmdSetDepthBias2EXT(ser, VK_NULL_HANDLE, NULL);
 
     // chunks that are reserved but not yet serialised
     case VulkanChunk::vkResetCommandPool:
@@ -4934,6 +5209,16 @@ void WrappedVulkan::ReplayLog(uint32_t startEventID, uint32_t endEventID, Replay
   {
     startEventID = 1;
     partial = false;
+
+    AddPendingObjectCleanup([this]() {
+      for(const rdcpair<VkCommandPool, VkCommandBuffer> &rerecord : m_RerecordCmdList)
+      {
+        m_commandQueueFamilies.erase(GetResID(rerecord.second));
+        vkFreeCommandBuffers(GetDev(), rerecord.first, 1, &rerecord.second);
+      }
+
+      m_RerecordCmdList.clear();
+    });
   }
 
   if(!partial)
@@ -4959,7 +5244,9 @@ void WrappedVulkan::ReplayLog(uint32_t startEventID, uint32_t endEventID, Replay
     else
     {
       // Copy the state in case m_RenderState was modified externally for the partial replay.
-      m_BakedCmdBufferInfo[GetPartialCommandBuffer()].state = m_RenderState;
+      ResourceId cmdBuf = GetPartialCommandBuffer();
+      if(cmdBuf != ResourceId())
+        m_BakedCmdBufferInfo[cmdBuf].state = m_RenderState;
     }
 
     VkResult vkr = VK_SUCCESS;
@@ -4993,7 +5280,7 @@ void WrappedVulkan::ReplayLog(uint32_t startEventID, uint32_t endEventID, Replay
       m_RenderState.subpassContents = VK_SUBPASS_CONTENTS_INLINE;
       m_RenderState.dynamicRendering.flags &= ~VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT;
 
-      bool rpActive = IsPartialRenderPassActive();
+      bool rpActive = IsPartialRenderPassActiveUnsuspended();
 
       if(rpActive)
       {
@@ -5072,7 +5359,7 @@ void WrappedVulkan::ReplayLog(uint32_t startEventID, uint32_t endEventID, Replay
 
     if(m_OutsideCmdBuffer != VK_NULL_HANDLE)
     {
-      if(replayType == eReplay_OnlyDraw)
+      if((replayType == eReplay_OnlyDraw) && (m_LastCmdBufferID != ResourceId()))
         UpdateImageStates(m_BakedCmdBufferInfo[m_LastCmdBufferID].imageStates);
 
       VkCommandBuffer cmd = m_OutsideCmdBuffer;
@@ -5089,7 +5376,7 @@ void WrappedVulkan::ReplayLog(uint32_t startEventID, uint32_t endEventID, Replay
       // even if it wasn't before (if the above event was a CmdBeginRenderPass).
       // If we began our own custom single-action loadrp, and it was ended by a CmdEndRenderPass,
       // we need to reverse the virtual transitions we did above, as it won't happen otherwise
-      if(IsPartialRenderPassActive())
+      if(IsPartialRenderPassActiveUnsuspended())
         m_RenderState.EndRenderPass(cmd);
 
       // we might have replayed a CmdBeginRenderPass or CmdEndRenderPass,
@@ -5123,14 +5410,6 @@ void WrappedVulkan::ReplayLog(uint32_t startEventID, uint32_t endEventID, Replay
         ObjDisp(GetDev())->DestroyEvent(Unwrap(GetDev()), m_CleanupEvents[i], NULL);
 
       m_CleanupEvents.clear();
-
-      for(const rdcpair<VkCommandPool, VkCommandBuffer> &rerecord : m_RerecordCmdList)
-      {
-        m_commandQueueFamilies.erase(GetResID(rerecord.second));
-        vkFreeCommandBuffers(GetDev(), rerecord.first, 1, &rerecord.second);
-      }
-
-      m_RerecordCmdList.clear();
     });
   }
 
@@ -5302,13 +5581,9 @@ void WrappedVulkan::AddDebugMessage(MessageCategory c, MessageSeverity sv, Messa
 void WrappedVulkan::AddDebugMessage(DebugMessage msg)
 {
   if(IsLoading(m_State))
-  {
-    m_EventMessages.push_back(msg);
-  }
+    m_LoadingEventNode.debugMessages.push_back(msg);
   else
-  {
     m_DebugMessages.push_back(msg);
-  }
 }
 
 rdcstr WrappedVulkan::GetPhysDeviceCompatString(bool externalResource, bool origInvalid)
@@ -5331,8 +5606,9 @@ rdcstr WrappedVulkan::GetPhysDeviceCompatString(bool externalResource, bool orig
   if(externalResource)
   {
     ret =
-        "This resource was externally imported, which cannot happen at replay time.\n"
-        "Some drivers do not allow externally-imported resources to be bound to non-external "
+        "This resource was externally imported or had external API properties, which does not "
+        "happen at replay time.\n"
+        "Some drivers do not allow externally-interacting resources to be bound to non-external "
         "memory, meaning that captures using resources like this can't be replayed.\n\n";
   }
 
@@ -5496,6 +5772,11 @@ VkBool32 WrappedVulkan::DebugCallback(MessageSeverity severity, MessageCategory 
 
     // dedicated allocation size must match, but we have no choice but to ignore this one
     if(strstr(pMessageId, "VUID-VkMemoryDedicatedAllocateInfo-image-02964"))
+      return false;
+
+    // this complains about access flags being set when not valid but we commonly hit this with our
+    // all-access barriers. We do not expect this to actually break so ignore the spam
+    if(strstr(pMessageId, "VUID-vkCmdPipelineBarrier-pImageMemoryBarriers-02820"))
       return false;
 
     // "Missing extension required by the device extension VK_KHR_driver_properties:
@@ -5685,11 +5966,11 @@ ResourceId WrappedVulkan::GetASFromAddr(VkDeviceAddress addr)
   return m_ASLookupByAddr[addr];
 }
 
-bool WrappedVulkan::IsPartialRenderPassActive()
+bool WrappedVulkan::IsPartialRenderPassActiveUnsuspended()
 {
   for(const CommandBufferNode &cmdNode : m_Partial.partialStack)
   {
-    if(cmdNode.renderPassActive)
+    if(cmdNode.renderPassActive && !cmdNode.renderPassSuspended)
       return true;
   }
 
@@ -5707,52 +5988,6 @@ bool WrappedVulkan::ShouldUpdateRenderpassActive(ResourceId cmdId, bool dynamicR
 
   // Otherwise we are in a non-dynamic renderpass and state should only be tracked for the primary
   return IsCommandBufferPartialPrimary(cmdId);
-}
-
-void WrappedVulkan::ShiftSuccessiveCommandNodes(uint32_t targetEvent, uint32_t eidShift,
-                                                CommandBufferNode *current)
-{
-  // first determine the primary command buffer node the target event occurs in. This will happen
-  // once, then current will be set for the following recursive cases.
-  if(current == NULL)
-  {
-    for(CommandBufferNode *primaryNode : m_Partial.commandTree)
-    {
-      if(IsEventInCommandBuffer(primaryNode, targetEvent,
-                                m_BakedCmdBufferInfo[primaryNode->cmdId].eventCount))
-      {
-        current = primaryNode;
-        break;
-      }
-    }
-  }
-
-  if(IsEventInCommandBuffer(current, targetEvent, m_BakedCmdBufferInfo[current->cmdId].eventCount))
-  {
-    // if the target event occurs within the scope of this command buffer, update the
-    // BakedCommandBufferInfo to account for the extra actions and events added by the indirect
-    // action
-    m_BakedCmdBufferInfo[current->cmdId].actionCount += eidShift;
-    m_BakedCmdBufferInfo[current->cmdId].eventCount += eidShift;
-  }
-  else if(current->beginEvent > targetEvent)
-  {
-    // if the target event occurs before the scope of this command buffer, shift the command buffer
-    // node's begin event to account for the events added by the indirect action
-    current->beginEvent += eidShift;
-  }
-  else
-  {
-    // otherwise the target event occurs after this command buffer, so do nothing and do not process
-    // any of this command buffer's children.
-    return;
-  }
-
-  // if the target event is in or before this command buffer, we also need to update any child command buffers.
-  for(CommandBufferNode *childNode : current->childCmdNodes)
-  {
-    ShiftSuccessiveCommandNodes(targetEvent, eidShift, childNode);
-  }
 }
 
 bool WrappedVulkan::InRerecordRange(ResourceId cmdid)
@@ -5838,17 +6073,151 @@ void WrappedVulkan::AddForcedReference(VkResourceRecord *record)
   GetResourceManager()->MarkResourceFrameReferenced(record->GetResourceID(), eFrameRef_Read);
 }
 
+void WrappedVulkan::BakeEventNodes(ActionDescription &rootAction)
+{
+  // EIDs start from 1
+  m_Events.resize(1);
+  uint32_t eid = 1;
+  uint32_t actionId = 1;
+  rdcarray<APIEvent> actionEvents;
+
+  rdcarray<ActionDescription *> actionStack;
+  actionStack.push_back(&rootAction);
+
+  ActionDescription *parentAction = actionStack.back();
+
+  rdcarray<CommandBufferExecuteInfo> pendingSubmits;
+  std::map<ResourceId, uint32_t> cmdBufStarts;
+
+  for(const VulkanEventNode &node : m_EventNodes)
+  {
+    m_Events.push_back(node.event);
+    APIEvent &apievent = m_Events.back();
+    apievent.eventId = eid;
+    actionEvents.push_back(apievent);
+
+    for(const DebugMessage &msg : node.debugMessages)
+    {
+      m_DebugMessages.push_back(msg);
+      m_DebugMessages.back().eventId = eid;
+    }
+
+    if(apievent.annotations)
+      m_EventAnnotations.push_back(apievent.annotations);
+
+    for(auto it = node.resourceUsage.begin(); it != node.resourceUsage.end(); ++it)
+    {
+      ResourceUsage usage = it->second;
+      m_ResourceUses[it->first].push_back({eid, usage});
+      m_EventFlags[eid] |= PipeRWUsageEventFlags(usage);
+    }
+
+    if(node.action.actionId == UINT32_MAX)
+    {
+      parentAction->children.push_back(node.action);
+      ActionDescription &action = parentAction->children.back();
+
+      RDCASSERT(action.events.isEmpty());
+      action.events.swap(actionEvents);
+      action.eventId = eid;
+      action.actionId = actionId;
+
+      ActionFlags flags = action.flags;
+      if(flags & ActionFlags::PushMarker)
+      {
+        actionStack.push_back(parentAction);
+        parentAction = &action;
+      }
+
+      if(!action.events.empty() && node.addActionUse)
+      {
+        ActionUse use(action.events.back().fileOffset, eid);
+
+        // insert in sorted location
+        auto drawit = std::lower_bound(m_ActionUses.begin(), m_ActionUses.end(), use);
+        m_ActionUses.insert(drawit - m_ActionUses.begin(), use);
+      }
+
+      if(flags & ActionFlags::PopMarker)
+      {
+        if(actionStack.count() == 0)
+        {
+          RDCERR("Pop but the action stack is empty");
+          parentAction = &rootAction;
+        }
+        else
+        {
+          parentAction = actionStack.back();
+          RDCASSERT(parentAction);
+          if(!parentAction)
+          {
+            RDCERR("NULL parent on the action stack");
+            parentAction = &rootAction;
+          }
+          actionStack.pop_back();
+        }
+      }
+
+      // markers don't increment action ID
+      ActionFlags MarkerMask = ActionFlags::SetMarker | ActionFlags::PushMarker |
+                               ActionFlags::PopMarker | ActionFlags::PassBoundary;
+      bool isMarker = (flags & MarkerMask) ? true : false;
+      if(!isMarker)
+        ++actionId;
+    }
+    else if(node.addActionUse)
+    {
+      // Special case to track non-action events which might have serialised debug messages i.e. vkQueueSubmit
+      ActionUse use(apievent.fileOffset, eid);
+
+      // insert in sorted location
+      auto drawit = std::lower_bound(m_ActionUses.begin(), m_ActionUses.end(), use);
+      m_ActionUses.insert(drawit - m_ActionUses.begin(), use);
+    }
+
+    if(node.addSubmit)
+    {
+      RDCASSERT(node.cmdBufId != ResourceId());
+      CommandBufferExecuteInfo execInfo;
+      execInfo.cmdId = node.cmdBufId;
+      execInfo.eid = eid + 1;
+      pendingSubmits.push_back(execInfo);
+    }
+    if(node.startChildExecute)
+    {
+      RDCASSERTNOTEQUAL(node.cmdBufId, ResourceId());
+      RDCASSERTNOTEQUAL(node.childCmdBufId, ResourceId());
+      RDCASSERTNOTEQUAL(node.cmdBufId, node.childCmdBufId);
+      CommandBufferExecuteInfo execInfo;
+      execInfo.cmdId = node.childCmdBufId;
+      execInfo.eid = eid + 1;
+      m_CommandBufferExecutes[node.cmdBufId].push_back(execInfo);
+      cmdBufStarts[node.childCmdBufId] = eid + 1;
+    }
+    if(node.endChildExecute)
+    {
+      RDCASSERT(cmdBufStarts.count(node.childCmdBufId) == 1);
+      uint32_t start = cmdBufStarts[node.childCmdBufId];
+      m_BakedCmdBufferInfo[node.childCmdBufId].eventCount = eid - start;
+    }
+    ++eid;
+  }
+  for(const CommandBufferExecuteInfo &submitInfo : pendingSubmits)
+  {
+    CommandBufferNode *rebaseNode = BuildSubmitTree(submitInfo.cmdId, submitInfo.eid);
+    m_Partial.commandTree.push_back(rebaseNode);
+  }
+}
+
 void WrappedVulkan::AddAction(const ActionDescription &a)
 {
-  m_AddedAction = true;
+  RDCASSERT(IsLoading(m_State));
 
-  ActionDescription action = a;
-  action.eventId = m_LastCmdBufferID != ResourceId()
-                       ? m_BakedCmdBufferInfo[m_LastCmdBufferID].curEventID
-                       : m_RootEventID;
-  action.actionId = m_LastCmdBufferID != ResourceId()
-                        ? m_BakedCmdBufferInfo[m_LastCmdBufferID].actionCount
-                        : m_RootActionID;
+  RDCASSERT(m_AddedEventNode);
+
+  VulkanEventNode &node = GetLastEventNode();
+  ActionDescription &action = node.action;
+  action = a;
 
   for(int i = 0; i < 8; i++)
     action.outputs[i] = ResourceId();
@@ -5857,6 +6226,7 @@ void WrappedVulkan::AddAction(const ActionDescription &a)
 
   if(m_LastCmdBufferID != ResourceId())
   {
+    node.addActionUse = true;
     const VulkanRenderState &state = m_BakedCmdBufferInfo[m_LastCmdBufferID].state;
 
     ResourceId fb = state.GetFramebuffer();
@@ -5880,15 +6250,13 @@ void WrappedVulkan::AddAction(const ActionDescription &a)
           continue;
 
         RDCASSERT(colAtt[i] < atts.size());
-        action.outputs[i] =
-            GetResourceManager()->GetOriginalID(m_CreationInfo.m_ImageView[atts[colAtt[i]]].image);
+        action.outputs[i] = m_CreationInfo.m_ImageView[atts[colAtt[i]]].image;
       }
 
       if(dsAtt != -1)
       {
         RDCASSERT(dsAtt < (int32_t)atts.size());
-        action.depthOut =
-            GetResourceManager()->GetOriginalID(m_CreationInfo.m_ImageView[atts[dsAtt]].image);
+        action.depthOut = m_CreationInfo.m_ImageView[atts[dsAtt]].image;
       }
     }
     else if(state.dynamicRendering.active)
@@ -5900,63 +6268,32 @@ void WrappedVulkan::AddAction(const ActionDescription &a)
         if(dyn.color[i].imageView == VK_NULL_HANDLE)
           continue;
 
-        action.outputs[i] = GetResourceManager()->GetOriginalID(
-            m_CreationInfo.m_ImageView[GetResID(dyn.color[i].imageView)].image);
+        action.outputs[i] = m_CreationInfo.m_ImageView[GetResID(dyn.color[i].imageView)].image;
       }
 
       if(dyn.depth.imageView != VK_NULL_HANDLE)
       {
-        action.depthOut = GetResourceManager()->GetOriginalID(
-            m_CreationInfo.m_ImageView[GetResID(dyn.depth.imageView)].image);
+        action.depthOut = m_CreationInfo.m_ImageView[GetResID(dyn.depth.imageView)].image;
       }
     }
   }
 
-  // markers don't increment action ID
-  ActionFlags MarkerMask = ActionFlags::SetMarker | ActionFlags::PushMarker |
-                           ActionFlags::PopMarker | ActionFlags::PassBoundary;
-  if(!(action.flags & MarkerMask))
-  {
-    if(m_LastCmdBufferID != ResourceId())
-      m_BakedCmdBufferInfo[m_LastCmdBufferID].actionCount++;
-    else
-      m_RootActionID++;
-  }
+  // Mark the action as active
+  action.actionId = UINT32_MAX;
 
-  action.events.swap(m_LastCmdBufferID != ResourceId()
-                         ? m_BakedCmdBufferInfo[m_LastCmdBufferID].curEvents
-                         : m_RootEvents);
-
-  // should have at least the root action here, push this action
-  // onto the back's children list.
-  if(!GetActionStack().empty())
-  {
-    VulkanActionTreeNode node(action);
-
-    node.resourceUsage.swap(m_BakedCmdBufferInfo[m_LastCmdBufferID].resourceUsage);
-
-    if(m_LastCmdBufferID != ResourceId())
-      AddUsage(node, m_BakedCmdBufferInfo[m_LastCmdBufferID].debugMessages);
-
-    node.children.reserve(action.children.size());
-    for(const ActionDescription &child : action.children)
-      node.children.push_back(VulkanActionTreeNode(child));
-    GetActionStack().back()->children.push_back(node);
-  }
-  else
-    RDCERR("Somehow lost action stack!");
+  if(m_LastCmdBufferID != ResourceId())
+    AddUsage(node);
 }
 
-void WrappedVulkan::AddUsage(VulkanActionTreeNode &actionNode, rdcarray<DebugMessage> &debugMessages)
+void WrappedVulkan::AddUsage(VulkanEventNode &eventNode)
 {
-  ActionDescription &action = actionNode.action;
-
-  const VulkanRenderState &state = m_BakedCmdBufferInfo[m_LastCmdBufferID].state;
-  uint32_t eid = action.eventId;
+  ActionDescription &action = eventNode.action;
 
   ActionFlags DrawMask = ActionFlags::MeshDispatch | ActionFlags::Drawcall | ActionFlags::Dispatch;
   if(!(action.flags & DrawMask))
     return;
+
+  const VulkanRenderState &state = m_BakedCmdBufferInfo[m_LastCmdBufferID].state;
 
   //////////////////////////////
   // Vertex input
@@ -5964,15 +6301,14 @@ void WrappedVulkan::AddUsage(VulkanActionTreeNode &actionNode, rdcarray<DebugMes
   if(action.flags & ActionFlags::Drawcall)
   {
     if(action.flags & ActionFlags::Indexed && state.ibuffer.buf != ResourceId())
-      actionNode.resourceUsage.push_back(
-          make_rdcpair(state.ibuffer.buf, EventUsage(eid, ResourceUsage::IndexBuffer)));
+      eventNode.resourceUsage.push_back(make_rdcpair(state.ibuffer.buf, ResourceUsage::IndexBuffer));
 
     for(size_t i = 0; i < state.vbuffers.size(); i++)
     {
       if(state.vbuffers[i].buf != ResourceId())
       {
-        actionNode.resourceUsage.push_back(
-            make_rdcpair(state.vbuffers[i].buf, EventUsage(eid, ResourceUsage::VertexBuffer)));
+        eventNode.resourceUsage.push_back(
+            make_rdcpair(state.vbuffers[i].buf, ResourceUsage::VertexBuffer));
       }
     }
 
@@ -5981,8 +6317,8 @@ void WrappedVulkan::AddUsage(VulkanActionTreeNode &actionNode, rdcarray<DebugMes
     {
       if(state.xfbbuffers[i].buf != ResourceId())
       {
-        actionNode.resourceUsage.push_back(
-            make_rdcpair(state.xfbbuffers[i].buf, EventUsage(eid, ResourceUsage::StreamOut)));
+        eventNode.resourceUsage.push_back(
+            make_rdcpair(state.xfbbuffers[i].buf, ResourceUsage::StreamOut));
       }
     }
   }
@@ -5993,7 +6329,7 @@ void WrappedVulkan::AddUsage(VulkanActionTreeNode &actionNode, rdcarray<DebugMes
   bool compute = bool(action.flags & ActionFlags::Dispatch);
 
   if(!compute)
-    AddFramebufferUsage(actionNode, state);
+    AddFramebufferUsage(eventNode, state);
 
   const VulkanStatePipeline &pipeState = (compute ? state.compute : state.graphics);
 
@@ -6002,9 +6338,9 @@ void WrappedVulkan::AddUsage(VulkanActionTreeNode &actionNode, rdcarray<DebugMes
 
   if(pipeState.UsingDescBufs())
   {
-    actionNode.deferredResourceUsage.push_back({});
+    eventNode.deferredResourceUsage.push_back({});
 
-    VulkanActionTreeNode::DeferredResourceUsage &def = actionNode.deferredResourceUsage.back();
+    VulkanEventNode::DeferredResourceUsage &def = eventNode.deferredResourceUsage.back();
 
     def.descBufVersionIdx = m_BakedCmdBufferInfo[m_LastCmdBufferID].descBufVersionIdx;
     def.pipeline = pipeState.shaderObject ? ResourceId() : pipeState.pipeline;
@@ -6035,23 +6371,11 @@ void WrappedVulkan::AddUsage(VulkanActionTreeNode &actionNode, rdcarray<DebugMes
       return;
   }
 
-  AddUsageForDescriptorSets(actionNode, debugMessages);
+  AddUsageForDescriptorSets(eventNode);
 }
 
-static rdcarray<int> ShaderStagesForAction(ActionDescription &action)
-{
-  if(action.flags & ActionFlags::Dispatch)
-    return {5};
-  else if(action.flags & ActionFlags::Drawcall)
-    return {0, 1, 2, 3, 4};
-  else if(action.flags & ActionFlags::MeshDispatch)
-    return {4, 6, 7};
-  return {};
-}
-
-void WrappedVulkan::AddUsageForDescriptorBuffers(VulkanActionTreeNode &actionNode,
-                                                 rdcarray<DebugMessage> &debugMessages,
-                                                 const VulkanActionTreeNode::DeferredResourceUsage &def)
+void WrappedVulkan::AddUsageForDescriptorBuffers(VulkanEventNode &eventNode,
+                                                 const VulkanEventNode::DeferredResourceUsage &def)
 {
   if(def.descBufVersionIdx >= m_DescriptorBufferVersions.size())
   {
@@ -6059,11 +6383,11 @@ void WrappedVulkan::AddUsageForDescriptorBuffers(VulkanActionTreeNode &actionNod
     return;
   }
 
-  ActionDescription &action = actionNode.action;
+  ActionDescription &action = eventNode.action;
 
   VulkanCreationInfo &c = m_CreationInfo;
 
-  rdcarray<int> shaderStages = ShaderStagesForAction(action);
+  rdcarray<int> shaderStages = ShaderStagesForAction(action.flags);
 
   GPUBuffer &buf = m_DescriptorBufferVersions[def.descBufVersionIdx];
 
@@ -6080,8 +6404,8 @@ void WrappedVulkan::AddUsageForDescriptorBuffers(VulkanActionTreeNode &actionNod
     if(sh.module == ResourceId())
       continue;
 
-    ResourceId origPipe = GetResourceManager()->GetOriginalID(pipe);
-    ResourceId origShad = GetResourceManager()->GetOriginalID(sh.module);
+    ResourceId origPipe = pipe;
+    ResourceId origShad = sh.module;
 
     for(const ConstantBlock &constantBlock : sh.refl->constantBlocks)
     {
@@ -6090,16 +6414,15 @@ void WrappedVulkan::AddUsageForDescriptorBuffers(VulkanActionTreeNode &actionNod
         continue;
 
       AddUsageForDescriptorBufferBind(
-          actionNode, debugMessages, def, descriptorBytes,
-          DescriptorDataSize(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER), DescriptorType::ConstantBuffer,
-          constantBlock.fixedBindSetOrSpace, constantBlock.fixedBindNumber,
-          ResourceUsage(uint32_t(ResourceUsage::VS_Constants) + shad));
+          eventNode, def, descriptorBytes, DescriptorDataSize(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER),
+          DescriptorType::ConstantBuffer, constantBlock.fixedBindSetOrSpace,
+          constantBlock.fixedBindNumber, ResourceUsage(uint32_t(ResourceUsage::VS_Constants) + shad));
     }
 
     for(const ShaderResource &res : sh.refl->readOnlyResources)
     {
       AddUsageForDescriptorBufferBind(
-          actionNode, debugMessages, def, descriptorBytes,
+          eventNode, def, descriptorBytes,
           DescriptorDataSize(MakeVkDescriptorType(res.descriptorType, res.isInputAttachment)),
           res.descriptorType, res.fixedBindSetOrSpace, res.fixedBindNumber,
           ResourceUsage(uint32_t(ResourceUsage::VS_Resource) + shad));
@@ -6108,7 +6431,7 @@ void WrappedVulkan::AddUsageForDescriptorBuffers(VulkanActionTreeNode &actionNod
     for(const ShaderResource &res : sh.refl->readWriteResources)
     {
       AddUsageForDescriptorBufferBind(
-          actionNode, debugMessages, def, descriptorBytes,
+          eventNode, def, descriptorBytes,
           DescriptorDataSize(MakeVkDescriptorType(res.descriptorType, false)), res.descriptorType,
           res.fixedBindSetOrSpace, res.fixedBindNumber,
           ResourceUsage(uint32_t(ResourceUsage::VS_RWResource) + shad));
@@ -6118,20 +6441,19 @@ void WrappedVulkan::AddUsageForDescriptorBuffers(VulkanActionTreeNode &actionNod
   buf.Unmap();
 }
 
-void WrappedVulkan::AddUsageForDescriptorBufferBind(
-    VulkanActionTreeNode &actionNode, rdcarray<DebugMessage> &debugMessages,
-    const VulkanActionTreeNode::DeferredResourceUsage &def, byte *descriptorBytes,
-    size_t descriptorSize, DescriptorType type, uint32_t bindset, uint32_t bind, ResourceUsage usage)
+void WrappedVulkan::AddUsageForDescriptorBufferBind(VulkanEventNode &eventNode,
+                                                    const VulkanEventNode::DeferredResourceUsage &def,
+                                                    byte *descriptorBytes, size_t descriptorSize,
+                                                    DescriptorType type, uint32_t bindset,
+                                                    uint32_t bind, ResourceUsage usage)
 {
   static bool hugeRangeWarned = false;
-  uint32_t eid = actionNode.action.eventId;
 
   const rdcarray<VulkanStatePipeline::DescriptorAndOffsets> &descSets = def.descSets;
 
   VulkanCreationInfo &c = m_CreationInfo;
 
   DebugMessage msg;
-  msg.eventId = eid;
   msg.category = MessageCategory::Execution;
   msg.messageID = 0;
   msg.source = MessageSource::IncorrectAPIUse;
@@ -6141,7 +6463,7 @@ void WrappedVulkan::AddUsageForDescriptorBufferBind(
   {
     msg.description =
         StringFormat::Fmt("Shader referenced a descriptor set %i that was not bound", bindset);
-    debugMessages.push_back(msg);
+    eventNode.debugMessages.push_back(msg);
     return;
   }
 
@@ -6157,7 +6479,7 @@ void WrappedVulkan::AddUsageForDescriptorBufferBind(
   {
     msg.description =
         StringFormat::Fmt("Shader referenced a descriptor set %i that was not bound", bindset);
-    debugMessages.push_back(msg);
+    eventNode.debugMessages.push_back(msg);
     return;
   }
 
@@ -6167,7 +6489,7 @@ void WrappedVulkan::AddUsageForDescriptorBufferBind(
         "Shader referenced a bind %i in descriptor set %i that does not exist. Mismatched "
         "descriptor set?",
         bind, bindset);
-    debugMessages.push_back(msg);
+    eventNode.debugMessages.push_back(msg);
     return;
   }
 
@@ -6188,21 +6510,20 @@ void WrappedVulkan::AddUsageForDescriptorBufferBind(
                          layout.bindings[bind].elemOffset + descriptorSize * a,
                      descriptorSize, type, tmp);
 
-    AddUsageForDescriptor(actionNode, tmp, usage);
+    AddUsageForDescriptor(eventNode, tmp, usage);
   }
 }
 
-void WrappedVulkan::AddUsageForDescriptorSets(VulkanActionTreeNode &actionNode,
-                                              rdcarray<DebugMessage> &debugMessages)
+void WrappedVulkan::AddUsageForDescriptorSets(VulkanEventNode &eventNode)
 {
-  ActionDescription &action = actionNode.action;
+  ActionDescription &action = eventNode.action;
 
   const VulkanRenderState &state = m_BakedCmdBufferInfo[m_LastCmdBufferID].state;
   const VulkanStatePipeline &pipeState =
       (action.flags & ActionFlags::Dispatch ? state.compute : state.graphics);
   VulkanCreationInfo &c = m_CreationInfo;
 
-  rdcarray<int> shaderStages = ShaderStagesForAction(action);
+  rdcarray<int> shaderStages = ShaderStagesForAction(action.flags);
 
   for(int shad : shaderStages)
   {
@@ -6215,8 +6536,8 @@ void WrappedVulkan::AddUsageForDescriptorSets(VulkanActionTreeNode &actionNode,
     if(sh.module == ResourceId())
       continue;
 
-    ResourceId origPipe = GetResourceManager()->GetOriginalID(pipe);
-    ResourceId origShad = GetResourceManager()->GetOriginalID(sh.module);
+    ResourceId origPipe = pipe;
+    ResourceId origShad = sh.module;
 
     for(const ConstantBlock &constantBlock : sh.refl->constantBlocks)
     {
@@ -6224,43 +6545,38 @@ void WrappedVulkan::AddUsageForDescriptorSets(VulkanActionTreeNode &actionNode,
       if(!constantBlock.bufferBacked)
         continue;
 
-      AddUsageForDescriptorSetBind(actionNode, debugMessages, constantBlock.fixedBindSetOrSpace,
+      AddUsageForDescriptorSetBind(eventNode, constantBlock.fixedBindSetOrSpace,
                                    constantBlock.fixedBindNumber,
                                    ResourceUsage(uint32_t(ResourceUsage::VS_Constants) + shad));
     }
 
     for(const ShaderResource &res : sh.refl->readOnlyResources)
     {
-      AddUsageForDescriptorSetBind(actionNode, debugMessages, res.fixedBindSetOrSpace,
-                                   res.fixedBindNumber,
+      AddUsageForDescriptorSetBind(eventNode, res.fixedBindSetOrSpace, res.fixedBindNumber,
                                    ResourceUsage(uint32_t(ResourceUsage::VS_Resource) + shad));
     }
 
     for(const ShaderResource &res : sh.refl->readWriteResources)
     {
-      AddUsageForDescriptorSetBind(actionNode, debugMessages, res.fixedBindSetOrSpace,
-                                   res.fixedBindNumber,
+      AddUsageForDescriptorSetBind(eventNode, res.fixedBindSetOrSpace, res.fixedBindNumber,
                                    ResourceUsage(uint32_t(ResourceUsage::VS_RWResource) + shad));
     }
   }
 }
 
-void WrappedVulkan::AddUsageForDescriptorSetBind(VulkanActionTreeNode &actionNode,
-                                                 rdcarray<DebugMessage> &debugMessages,
-                                                 uint32_t bindset, uint32_t bind, ResourceUsage usage)
+void WrappedVulkan::AddUsageForDescriptorSetBind(VulkanEventNode &eventNode, uint32_t bindset,
+                                                 uint32_t bind, ResourceUsage usage)
 {
   static bool hugeRangeWarned = false;
-  uint32_t eid = actionNode.action.eventId;
 
   const VulkanRenderState &state = m_BakedCmdBufferInfo[m_LastCmdBufferID].state;
   const rdcarray<VulkanStatePipeline::DescriptorAndOffsets> &descSets =
-      ((actionNode.action.flags & ActionFlags::Dispatch) ? state.compute.descSets
-                                                         : state.graphics.descSets);
+      ((eventNode.action.flags & ActionFlags::Dispatch) ? state.compute.descSets
+                                                        : state.graphics.descSets);
 
   VulkanCreationInfo &c = m_CreationInfo;
 
   DebugMessage msg;
-  msg.eventId = eid;
   msg.category = MessageCategory::Execution;
   msg.messageID = 0;
   msg.source = MessageSource::IncorrectAPIUse;
@@ -6270,7 +6586,7 @@ void WrappedVulkan::AddUsageForDescriptorSetBind(VulkanActionTreeNode &actionNod
   {
     msg.description =
         StringFormat::Fmt("Shader referenced a descriptor set %i that was not bound", bindset);
-    debugMessages.push_back(msg);
+    eventNode.debugMessages.push_back(msg);
     return;
   }
 
@@ -6285,7 +6601,7 @@ void WrappedVulkan::AddUsageForDescriptorSetBind(VulkanActionTreeNode &actionNod
   {
     msg.description =
         StringFormat::Fmt("Shader referenced a descriptor set %i that was not bound", bindset);
-    debugMessages.push_back(msg);
+    eventNode.debugMessages.push_back(msg);
     return;
   }
 
@@ -6295,7 +6611,7 @@ void WrappedVulkan::AddUsageForDescriptorSetBind(VulkanActionTreeNode &actionNod
         "Shader referenced a bind %i in descriptor set %i that does not exist. Mismatched "
         "descriptor set?",
         bind, bindset);
-    debugMessages.push_back(msg);
+    eventNode.debugMessages.push_back(msg);
     return;
   }
 
@@ -6309,7 +6625,7 @@ void WrappedVulkan::AddUsageForDescriptorSetBind(VulkanActionTreeNode &actionNod
         "Shader referenced a bind %i in descriptor set %i that does not exist. Mismatched "
         "descriptor set?",
         bind, bindset);
-    debugMessages.push_back(msg);
+    eventNode.debugMessages.push_back(msg);
     return;
   }
 
@@ -6330,15 +6646,14 @@ void WrappedVulkan::AddUsageForDescriptorSetBind(VulkanActionTreeNode &actionNod
     if(!descset.data.binds[bind])
       return;
 
-    AddUsageForDescriptor(actionNode, descset.data.binds[bind][a], usage);
+    AddUsageForDescriptor(eventNode, descset.data.binds[bind][a], usage);
   }
 }
 
-void WrappedVulkan::AddUsageForDescriptor(VulkanActionTreeNode &actionNode,
-                                          const DescriptorSetSlot &slot, ResourceUsage usage)
+void WrappedVulkan::AddUsageForDescriptor(VulkanEventNode &eventNode, const DescriptorSetSlot &slot,
+                                          ResourceUsage usage)
 {
   VulkanCreationInfo &c = m_CreationInfo;
-  uint32_t eid = actionNode.action.eventId;
 
   // handled as part of the framebuffer attachments
   if(slot.type == DescriptorSlotType::InputAttachment)
@@ -6380,12 +6695,17 @@ void WrappedVulkan::AddUsageForDescriptor(VulkanActionTreeNode &actionNode,
   }
 
   if(id != ResourceId())
-    actionNode.resourceUsage.push_back(make_rdcpair(id, EventUsage(eid, usage)));
+    eventNode.resourceUsage.push_back(make_rdcpair(id, usage));
 }
 
-void WrappedVulkan::AddFramebufferUsage(VulkanActionTreeNode &actionNode,
+void WrappedVulkan::AddFramebufferUsage(VulkanEventNode &eventNode,
                                         const VulkanRenderState &renderState)
 {
+  ActionDescription &action = eventNode.action;
+  ActionFlags DrawMask = ActionFlags::MeshDispatch | ActionFlags::Drawcall;
+  if(!(action.flags & DrawMask))
+    return;
+
   ResourceId renderPass = renderState.GetRenderPass();
   ResourceId framebuffer = renderState.GetFramebuffer();
 
@@ -6393,7 +6713,6 @@ void WrappedVulkan::AddFramebufferUsage(VulkanActionTreeNode &actionNode,
   const rdcarray<ResourceId> &fbattachments = renderState.GetFramebufferAttachments();
 
   VulkanCreationInfo &c = m_CreationInfo;
-  uint32_t e = actionNode.action.eventId;
 
   if(renderPass != ResourceId() && framebuffer != ResourceId())
   {
@@ -6413,9 +6732,8 @@ void WrappedVulkan::AddFramebufferUsage(VulkanActionTreeNode &actionNode,
         uint32_t att = sub.inputAttachments[i];
         if(att == VK_ATTACHMENT_UNUSED)
           continue;
-        actionNode.resourceUsage.push_back(
-            make_rdcpair(c.m_ImageView[fbattachments[att]].image,
-                         EventUsage(e, ResourceUsage::InputTarget, fbattachments[att])));
+        eventNode.resourceUsage.push_back(
+            make_rdcpair(c.m_ImageView[fbattachments[att]].image, ResourceUsage::InputTarget));
       }
 
       for(size_t i = 0; i < sub.colorAttachments.size(); i++)
@@ -6423,17 +6741,16 @@ void WrappedVulkan::AddFramebufferUsage(VulkanActionTreeNode &actionNode,
         uint32_t att = sub.colorAttachments[i];
         if(att == VK_ATTACHMENT_UNUSED)
           continue;
-        actionNode.resourceUsage.push_back(
-            make_rdcpair(c.m_ImageView[fbattachments[att]].image,
-                         EventUsage(e, ResourceUsage::ColorTarget, fbattachments[att])));
+        eventNode.resourceUsage.push_back(make_rdcpair(
+            c.m_ImageView[fbattachments[att]].image,
+            sub.customResolve ? ResourceUsage::ResolveDst : ResourceUsage::ColorTarget));
       }
 
       if(sub.depthstencilAttachment >= 0)
       {
         int32_t att = sub.depthstencilAttachment;
-        actionNode.resourceUsage.push_back(
-            make_rdcpair(c.m_ImageView[fbattachments[att]].image,
-                         EventUsage(e, ResourceUsage::DepthStencilTarget, fbattachments[att])));
+        eventNode.resourceUsage.push_back(make_rdcpair(c.m_ImageView[fbattachments[att]].image,
+                                                       ResourceUsage::DepthStencilTarget));
       }
     }
   }
@@ -6446,66 +6763,89 @@ void WrappedVulkan::AddFramebufferUsage(VulkanActionTreeNode &actionNode,
       if(dyn.color[i].imageView == VK_NULL_HANDLE)
         continue;
 
-      actionNode.resourceUsage.push_back(make_rdcpair(
-          c.m_ImageView[GetResID(dyn.color[i].imageView)].image,
-          EventUsage(e, ResourceUsage::ColorTarget, GetResID(dyn.color[i].imageView))));
+      bool isCustomResolve = renderState.dynamicRendering.beginCustomResolve &&
+                             (dyn.color[i].resolveMode & VK_RESOLVE_MODE_CUSTOM_BIT_EXT);
+      if(!isCustomResolve)
+      {
+        eventNode.resourceUsage.push_back(make_rdcpair(
+            c.m_ImageView[GetResID(dyn.color[i].imageView)].image, ResourceUsage::ColorTarget));
+      }
+      else
+      {
+        eventNode.resourceUsage.push_back(make_rdcpair(
+            c.m_ImageView[GetResID(dyn.color[i].imageView)].image, ResourceUsage::InputTarget));
+        eventNode.resourceUsage.push_back(make_rdcpair(
+            c.m_ImageView[GetResID(dyn.color[i].resolveImageView)].image, ResourceUsage::ResolveDst));
+      }
     }
 
     if(dyn.depth.imageView != VK_NULL_HANDLE)
     {
-      actionNode.resourceUsage.push_back(make_rdcpair(
-          c.m_ImageView[GetResID(dyn.depth.imageView)].image,
-          EventUsage(e, ResourceUsage::DepthStencilTarget, GetResID(dyn.depth.imageView))));
+      bool isCustomResolve = renderState.dynamicRendering.beginCustomResolve &&
+                             (dyn.depth.resolveMode & VK_RESOLVE_MODE_CUSTOM_BIT_EXT);
+      if(!isCustomResolve)
+      {
+        eventNode.resourceUsage.push_back(make_rdcpair(
+            c.m_ImageView[GetResID(dyn.depth.imageView)].image, ResourceUsage::DepthStencilTarget));
+      }
+      else
+      {
+        eventNode.resourceUsage.push_back(make_rdcpair(
+            c.m_ImageView[GetResID(dyn.depth.imageView)].image, ResourceUsage::InputTarget));
+        eventNode.resourceUsage.push_back(make_rdcpair(
+            c.m_ImageView[GetResID(dyn.depth.resolveImageView)].image, ResourceUsage::ResolveDst));
+      }
     }
 
     if(dyn.stencil.imageView != VK_NULL_HANDLE && dyn.depth.imageView != dyn.stencil.imageView)
     {
-      actionNode.resourceUsage.push_back(make_rdcpair(
-          c.m_ImageView[GetResID(dyn.stencil.imageView)].image,
-          EventUsage(e, ResourceUsage::DepthStencilTarget, GetResID(dyn.stencil.imageView))));
+      bool isCustomResolve = renderState.dynamicRendering.beginCustomResolve &&
+                             (dyn.stencil.resolveMode & VK_RESOLVE_MODE_CUSTOM_BIT_EXT);
+      if(!isCustomResolve)
+
+      {
+        eventNode.resourceUsage.push_back(make_rdcpair(
+            c.m_ImageView[GetResID(dyn.stencil.imageView)].image, ResourceUsage::DepthStencilTarget));
+      }
+      else
+      {
+        eventNode.resourceUsage.push_back(make_rdcpair(
+            c.m_ImageView[GetResID(dyn.stencil.imageView)].image, ResourceUsage::InputTarget));
+        eventNode.resourceUsage.push_back(make_rdcpair(
+            c.m_ImageView[GetResID(dyn.stencil.resolveImageView)].image, ResourceUsage::ResolveDst));
+      }
     }
   }
 }
 
-void WrappedVulkan::AddFramebufferUsageAllChildren(VulkanActionTreeNode &actionNode,
-                                                   const VulkanRenderState &renderState)
-{
-  for(VulkanActionTreeNode &c : actionNode.children)
-    AddFramebufferUsageAllChildren(c, renderState);
-
-  AddFramebufferUsage(actionNode, renderState);
-}
-
 void WrappedVulkan::AddEvent()
 {
-  APIEvent apievent;
+  RDCASSERT(IsLoading(m_State));
 
+  rdcarray<VulkanEventNode> &eventNodes =
+      (m_LastCmdBufferID != ResourceId() ? m_BakedCmdBufferInfo[m_LastCmdBufferID].eventNodes
+                                         : m_EventNodes);
+  eventNodes.emplace_back(m_LoadingEventNode);
+  m_LoadingEventNode = VulkanEventNode();
+
+  VulkanEventNode &node = eventNodes.back();
+
+  APIEvent &apievent = node.event;
   apievent.fileOffset = m_CurChunkOffset;
-  apievent.eventId = m_LastCmdBufferID != ResourceId()
-                         ? m_BakedCmdBufferInfo[m_LastCmdBufferID].curEventID
-                         : m_RootEventID;
-
   apievent.chunkIndex = uint32_t(m_StructuredFile->chunks.size() - 1);
-
-  for(DebugMessage &msg : m_EventMessages)
-    msg.eventId = apievent.eventId;
-
+  // event IDs start from one not zero
+  apievent.eventId = (uint32_t)eventNodes.count();
   if(m_LastCmdBufferID != ResourceId())
   {
-    m_BakedCmdBufferInfo[m_LastCmdBufferID].curEvents.push_back(apievent);
-
-    m_BakedCmdBufferInfo[m_LastCmdBufferID].debugMessages.append(m_EventMessages);
-    m_EventMessages.clear();
+    node.annotations.swap(m_BakedCmdBufferInfo[m_LastCmdBufferID].pendingAnnotations);
   }
   else
   {
-    m_RootEvents.push_back(apievent);
-    m_Events.resize(apievent.eventId + 1);
-    m_Events[apievent.eventId] = apievent;
-
-    m_DebugMessages.append(m_EventMessages);
-    m_EventMessages.clear();
+    if(m_RootAnnotation)
+      apievent.annotations = m_RootAnnotation->Duplicate();
   }
+
+  m_AddedEventNode = true;
 }
 
 const APIEvent &WrappedVulkan::GetEvent(uint32_t eventId)
@@ -6595,24 +6935,30 @@ VkQueueFlags WrappedVulkan::GetCommandType(ResourceId cmdId)
   return m_PhysicalDeviceData.queueProps[it->second].queueFlags;
 }
 
-bool WrappedVulkan::EraseImageState(ResourceId id)
+void WrappedVulkan::EraseImageState(ResourceId id)
 {
+  {
+    SCOPED_READLOCK(m_CapTransitionLock);
+    if(IsActiveCapturing(m_State))
+    {
+      SCOPED_LOCK(m_DeferredDestructLock);
+      m_DeferredDestructResources.DeadImageStates.push_back(id);
+      return;
+    }
+  }
+
   SCOPED_LOCK(m_ImageStatesLock);
   auto it = m_ImageStates.find(id);
   if(it != m_ImageStates.end())
-  {
     m_ImageStates.erase(it);
-    return true;
-  }
-  return false;
 }
 
 void WrappedVulkan::UpdateImageStates(const rdcflatmap<ResourceId, ImageState> &dstStates)
 {
-  // this function expects the number of updates to be orders of magnitude fewer than the number of
-  // existing images. If there are a small number of images in total then it doesn't matter much,
-  // and if there are a large number of images then it's better to do repeated map lookups rather
-  // than spend time iterating linearly across the map for a sparse set of updates.
+  // this function expects the number of updates to be orders of magnitude fewer than the number
+  // of existing images. If there are a small number of images in total then it doesn't matter
+  // much, and if there are a large number of images then it's better to do repeated map lookups
+  // rather than spend time iterating linearly across the map for a sparse set of updates.
   SCOPED_LOCK(m_ImageStatesLock);
   auto dstIt = dstStates.begin();
   ImageTransitionInfo info = GetImageTransitionInfo();
@@ -6656,8 +7002,8 @@ void WrappedVulkan::ReplayDraw(VkCommandBuffer cmd, const ActionDescription &act
   }
   else
   {
-    // otherwise it's a bit more complex, we need to set up a multidraw with the first N draws nop'd
-    // out and the parameters added into the last one
+    // otherwise it's a bit more complex, we need to set up a multidraw with the first N draws
+    // nop'd out and the parameters added into the last one
 
     VkMarkerRegion::Begin(StringFormat::Fmt("ReplayDraw(drawIndex=%u)", action.drawIndex), cmd);
 

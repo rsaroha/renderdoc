@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2025 Baldur Karlsson
+ * Copyright (c) 2017-2026 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -304,9 +304,9 @@ public:
             if(mod.unboundPS)
             {
               if(!m_IsDepth)
-                return tr("No Pixel\nShader\nBound\n\n");
+                return tr("No Pixel\nShader\nOutput\n\n");
               else
-                return tr("No Pixel Shader Bound\n\n") + modString(mod.shaderOut);
+                return tr("No Pixel Shader Output\n\n") + modString(mod.shaderOut);
             }
             if(mod.directShaderWrite)
               return tr("Tex Before\n\n") + modString(mod.preMod);

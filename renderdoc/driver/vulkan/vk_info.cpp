@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2025 Baldur Karlsson
+ * Copyright (c) 2015-2026 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -720,11 +720,7 @@ bool CreateDescriptorWritesForSlotData(WrappedVulkan *vk, rdcarray<VkWriteDescri
     uint32_t arrayIdx = slot - writes.back().dstArrayElement;
 
     ResourceId resId = slots[slot].resource;
-    if(rm->HasLiveResource(resId))
-      resId = rm->GetLiveID(resId);
     ResourceId sampId = slots[slot].sampler;
-    if(rm->HasLiveResource(sampId))
-      sampId = rm->GetLiveID(sampId);
 
     switch(descType)
     {
@@ -734,15 +730,15 @@ bool CreateDescriptorWritesForSlotData(WrappedVulkan *vk, rdcarray<VkWriteDescri
       case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
       case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
       {
-        if(descType != VK_DESCRIPTOR_TYPE_SAMPLER && rm->HasCurrentResource(resId))
-          writeImage[arrayIdx].imageView = rm->GetCurrentHandle<VkImageView>(resId);
+        if(descType != VK_DESCRIPTOR_TYPE_SAMPLER && rm->HasResource(resId))
+          writeImage[arrayIdx].imageView = rm->GetHandle<VkImageView>(resId);
         else
           writeImage[arrayIdx].imageView = VK_NULL_HANDLE;
 
         if((descType == VK_DESCRIPTOR_TYPE_SAMPLER ||
             descType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) &&
-           rm->HasCurrentResource(sampId))
-          writeImage[arrayIdx].sampler = rm->GetCurrentHandle<VkSampler>(sampId);
+           rm->HasResource(sampId))
+          writeImage[arrayIdx].sampler = rm->GetHandle<VkSampler>(sampId);
         else
           writeImage[arrayIdx].sampler = VK_NULL_HANDLE;
 
@@ -753,7 +749,7 @@ bool CreateDescriptorWritesForSlotData(WrappedVulkan *vk, rdcarray<VkWriteDescri
         // validity checking doesn't have to look them up.
         if(immutableSamplers && descType != VK_DESCRIPTOR_TYPE_SAMPLER)
         {
-          writeImage[arrayIdx].sampler = rm->GetCurrentHandle<VkSampler>(immutableSamplers[slot]);
+          writeImage[arrayIdx].sampler = rm->GetHandle<VkSampler>(immutableSamplers[slot]);
         }
 
         // set the write array (possibly redundant if we're collating as writeImage only
@@ -764,8 +760,8 @@ bool CreateDescriptorWritesForSlotData(WrappedVulkan *vk, rdcarray<VkWriteDescri
       case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
       case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
       {
-        if(rm->HasCurrentResource(resId))
-          writeTexelBuffer[arrayIdx] = rm->GetCurrentHandle<VkBufferView>(resId);
+        if(rm->HasResource(resId))
+          writeTexelBuffer[arrayIdx] = rm->GetHandle<VkBufferView>(resId);
         else
           writeTexelBuffer[arrayIdx] = VK_NULL_HANDLE;
 
@@ -777,8 +773,8 @@ bool CreateDescriptorWritesForSlotData(WrappedVulkan *vk, rdcarray<VkWriteDescri
       case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
       case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
       {
-        if(rm->HasCurrentResource(resId))
-          writeBuffer[arrayIdx].buffer = rm->GetCurrentHandle<VkBuffer>(resId);
+        if(rm->HasResource(resId))
+          writeBuffer[arrayIdx].buffer = rm->GetHandle<VkBuffer>(resId);
         else
           writeBuffer[arrayIdx].buffer = VK_NULL_HANDLE;
         writeBuffer[arrayIdx].offset = slots[slot].offset;
@@ -993,7 +989,7 @@ static void ProcessStaticDescriptorAccess(VulkanResourceManager *resourceMan,
     }
     else if(setLayout->flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_EMBEDDED_IMMUTABLE_SAMPLERS_BIT_EXT)
     {
-      access.descriptorStore = resourceMan->GetOriginalID(setLayout->resourceId);
+      access.descriptorStore = setLayout->resourceId;
       access.byteSize = 1;
       access.byteOffset = bind.fixedBindNumber;
     }
@@ -1153,8 +1149,6 @@ void VulkanCreationInfo::ShaderObject::Init(VulkanResourceManager *resourceMan,
   // specialization info
   if(pCreateInfo->pSpecializationInfo)
   {
-    key = ShaderModuleReflectionKey(shad.stage, shad.entryPoint, id);
-
     const byte *data = (const byte *)pCreateInfo->pSpecializationInfo->pData;
 
     const VkSpecializationMapEntry *maps = pCreateInfo->pSpecializationInfo->pMapEntries;
@@ -1171,10 +1165,19 @@ void VulkanCreationInfo::ShaderObject::Init(VulkanResourceManager *resourceMan,
     }
   }
 
+  const VkCustomResolveCreateInfoEXT *customResInfo =
+      (const VkCustomResolveCreateInfoEXT *)FindNextStruct(
+          pCreateInfo, VK_STRUCTURE_TYPE_CUSTOM_RESOLVE_CREATE_INFO_EXT);
+  if(customResInfo)
+  {
+    hasCustomResCreateInfo = true;
+    customResolve = (customResInfo->customResolve == VK_TRUE);
+  }
+
   ShaderModuleReflection &reflData = info.m_ShaderModule[id].m_Reflections[key];
 
-  reflData.Init(resourceMan, id, info.m_ShaderModule[id].spirv, shad.entryPoint, pCreateInfo->stage,
-                shad.specialization);
+  reflData.Init(resourceMan, info, id, info.m_ShaderModule[id].spirv, shad.entryPoint,
+                pCreateInfo->stage, shad.specialization);
 
   shad.refl = reflData.refl;
   shad.patchData = &reflData.patchData;
@@ -1183,8 +1186,7 @@ void VulkanCreationInfo::ShaderObject::Init(VulkanResourceManager *resourceMan,
   for(ResourceId setLayout : descSetLayouts)
     setLayoutInfos.push_back(&info.m_DescSetLayout[setLayout]);
 
-  ProcessStaticDescriptorAccess(resourceMan, shad.refl, resourceMan->GetOriginalID(id),
-                                staticDescriptorAccess, setLayoutInfos);
+  ProcessStaticDescriptorAccess(resourceMan, shad.refl, id, staticDescriptorAccess, setLayoutInfos);
 }
 
 void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan,
@@ -1234,6 +1236,26 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan,
     colorFormats.clear();
     depthFormat = VK_FORMAT_UNDEFINED;
     stencilFormat = VK_FORMAT_UNDEFINED;
+  }
+  const VkCustomResolveCreateInfoEXT *customResInfo =
+      (const VkCustomResolveCreateInfoEXT *)FindNextStruct(
+          pCreateInfo, VK_STRUCTURE_TYPE_CUSTOM_RESOLVE_CREATE_INFO_EXT);
+  if(customResInfo)
+  {
+    hasCustomResCreateInfo = true;
+    customResCreateInfo.customResolve = (customResInfo->customResolve == VK_TRUE);
+    customResCreateInfo.colorFormats.assign(customResInfo->pColorAttachmentFormats,
+                                            customResInfo->colorAttachmentCount);
+    customResCreateInfo.depthFormat = customResInfo->depthAttachmentFormat;
+    customResCreateInfo.stencilFormat = customResInfo->stencilAttachmentFormat;
+  }
+  else
+  {
+    hasCustomResCreateInfo = false;
+    customResCreateInfo.customResolve = false;
+    customResCreateInfo.colorFormats.clear();
+    customResCreateInfo.depthFormat = VK_FORMAT_UNDEFINED;
+    customResCreateInfo.stencilFormat = VK_FORMAT_UNDEFINED;
   }
 
   dynamicRenderingLocalRead.Init((const VkBaseInStructure *)pCreateInfo);
@@ -1342,7 +1364,7 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan,
 
     ShaderModuleReflection &reflData = info.m_ShaderModule[shadid].m_Reflections[key];
 
-    reflData.Init(resourceMan, shadid, info.m_ShaderModule[shadid].spirv, shad.entryPoint,
+    reflData.Init(resourceMan, info, shadid, info.m_ShaderModule[shadid].spirv, shad.entryPoint,
                   pCreateInfo->pStages[i].stage, shad.specialization);
 
     shad.refl = reflData.refl;
@@ -1539,6 +1561,19 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan,
   {
     conservativeRasterizationMode = conservRast->conservativeRasterizationMode;
     extraPrimitiveOverestimationSize = conservRast->extraPrimitiveOverestimationSize;
+  }
+
+  // VkDepthBiasRepresentationInfoEXT
+  depthBiasRepresentation = VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORMAT_EXT;
+  depthBiasExact = false;
+
+  const VkDepthBiasRepresentationInfoEXT *depthBiasRepr =
+      (const VkDepthBiasRepresentationInfoEXT *)FindNextStruct(
+          pCreateInfo->pRasterizationState, VK_STRUCTURE_TYPE_DEPTH_BIAS_REPRESENTATION_INFO_EXT);
+  if(depthBiasRepr)
+  {
+    depthBiasRepresentation = depthBiasRepr->depthBiasRepresentation;
+    depthBiasExact = depthBiasRepr->depthBiasExact;
   }
 
   // VkPipelineRasterizationLineStateCreateInfo
@@ -1773,6 +1808,8 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan,
         depthBiasConstantFactor = pipeInfo.depthBiasConstantFactor;
         depthBiasClamp = pipeInfo.depthBiasClamp;
         depthBiasSlopeFactor = pipeInfo.depthBiasSlopeFactor;
+        depthBiasRepresentation = pipeInfo.depthBiasRepresentation;
+        depthBiasExact = pipeInfo.depthBiasExact;
         lineWidth = pipeInfo.lineWidth;
 
         rasterizationStream = pipeInfo.rasterizationStream;
@@ -1925,8 +1962,7 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan,
     setLayoutInfos.push_back(&info.m_DescSetLayout[setLayout]);
 
   for(const ShaderEntry &shad : shaders)
-    ProcessStaticDescriptorAccess(resourceMan, shad.refl, resourceMan->GetOriginalID(id),
-                                  staticDescriptorAccess, setLayoutInfos);
+    ProcessStaticDescriptorAccess(resourceMan, shad.refl, id, staticDescriptorAccess, setLayoutInfos);
 }
 
 void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan, VulkanCreationInfo &info,
@@ -2008,7 +2044,7 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan, Vulk
 
     ShaderModuleReflection &reflData = info.m_ShaderModule[shadid].m_Reflections[key];
 
-    reflData.Init(resourceMan, shadid, info.m_ShaderModule[shadid].spirv, shad.entryPoint,
+    reflData.Init(resourceMan, info, shadid, info.m_ShaderModule[shadid].spirv, shad.entryPoint,
                   pCreateInfo->stage.stage, shad.specialization);
 
     shad.refl = reflData.refl;
@@ -2061,8 +2097,7 @@ void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan, Vulk
     setLayoutInfos.push_back(&info.m_DescSetLayout[setLayout]);
 
   for(const ShaderEntry &shad : shaders)
-    ProcessStaticDescriptorAccess(resourceMan, shad.refl, resourceMan->GetOriginalID(id),
-                                  staticDescriptorAccess, setLayoutInfos);
+    ProcessStaticDescriptorAccess(resourceMan, shad.refl, id, staticDescriptorAccess, setLayoutInfos);
 }
 
 void VulkanCreationInfo::Pipeline::Init(VulkanResourceManager *resourceMan,
@@ -2256,6 +2291,7 @@ void VulkanCreationInfo::RenderPass::Init(VulkanResourceManager *resourceMan,
           dst.multiviews.push_back(i);
       }
     }
+    dst.customResolve = (src.flags & VK_SUBPASS_DESCRIPTION_CUSTOM_RESOLVE_BIT_EXT) != 0;
   }
 
   for(uint32_t i = 0; i < pCreateInfo->dependencyCount; i++)
@@ -2422,6 +2458,7 @@ void VulkanCreationInfo::RenderPass::Init(VulkanResourceManager *resourceMan,
       if(src.viewMask & (1 << i))
         dst.multiviews.push_back(i);
     }
+    dst.customResolve = (src.flags & VK_SUBPASS_DESCRIPTION_CUSTOM_RESOLVE_BIT_EXT) != 0;
   }
 }
 
@@ -2566,24 +2603,26 @@ void VulkanCreationInfo::Image::Init(VulkanResourceManager *resourceMan, VulkanC
 
   if(FindNextStruct(pCreateInfo, VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO_NV) ||
      FindNextStruct(pCreateInfo, VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO) ||
-     FindNextStruct(pCreateInfo, VK_STRUCTURE_TYPE_EXTERNAL_FORMAT_ANDROID))
+     FindNextStruct(pCreateInfo, VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT) ||
+     FindNextStruct(pCreateInfo, VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT))
   {
     external = true;
   }
 
   creationFlags = TextureCategory::NoFlags;
 
-  if(pCreateInfo->usage & VK_IMAGE_USAGE_SAMPLED_BIT)
+  VkImageUsageFlagBits2KHR usage = (VkImageUsageFlagBits2KHR)GetImageUsageFlags(pCreateInfo);
+
+  if(usage & VK_IMAGE_USAGE_SAMPLED_BIT)
     creationFlags |= TextureCategory::ShaderRead;
-  if(pCreateInfo->usage &
-     (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT))
+  if(usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT))
     creationFlags |= TextureCategory::ColorTarget;
-  if(pCreateInfo->usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)
+  if(usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)
     creationFlags |= TextureCategory::DepthTarget;
-  if(pCreateInfo->usage & VK_IMAGE_USAGE_STORAGE_BIT)
+  if(usage & VK_IMAGE_USAGE_STORAGE_BIT)
     creationFlags |= TextureCategory::ShaderReadWrite;
 
-  cube = (pCreateInfo->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) ? true : false;
+  cube = (GetImageCreateFlags(pCreateInfo) & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) ? true : false;
 
   address = 0;
 }
@@ -2724,6 +2763,26 @@ void VulkanCreationInfo::ImageView::Init(VulkanResourceManager *resourceMan, Vul
   }
 
   isDepthImage = !!(info.m_Image[image].creationFlags & TextureCategory::DepthTarget);
+
+  storageSliceOffset = 0;
+  storageSliceCount = 0;
+
+  const VkImageViewSlicedCreateInfoEXT *slicedInfo =
+      (const VkImageViewSlicedCreateInfoEXT *)FindNextStruct(
+          pCreateInfo, VK_STRUCTURE_TYPE_IMAGE_VIEW_SLICED_CREATE_INFO_EXT);
+  if(slicedInfo)
+  {
+    // only valid for 3D image views, which should have 0/1 layers currently
+    RDCASSERTEQUAL(range.baseArrayLayer, 0);
+    RDCASSERTEQUAL(range.layerCount, 1);
+    storageSliceOffset = slicedInfo->sliceOffset;
+    storageSliceCount = slicedInfo->sliceCount;
+
+    if(storageSliceCount == VK_REMAINING_3D_SLICES_EXT)
+    {
+      storageSliceCount = info.m_Image[image].extent.depth - storageSliceOffset;
+    }
+  }
 }
 
 void VulkanCreationInfo::ShaderModule::Init(VulkanResourceManager *resourceMan,
@@ -2740,11 +2799,13 @@ void VulkanCreationInfo::ShaderModule::Init(VulkanResourceManager *resourceMan,
     RDCASSERT(pCreateInfo->codeSize % sizeof(uint32_t) == 0);
     spirv.Parse(rdcarray<uint32_t>((uint32_t *)(pCreateInfo->pCode),
                                    pCreateInfo->codeSize / sizeof(uint32_t)));
+    initialSpirv.clear();
   }
 }
 
-void VulkanCreationInfo::ShaderModule::Reinit()
+bool VulkanCreationInfo::ShaderModule::Reinit()
 {
+  rdcstr loadingLog;
   bool lz4 = false;
 
   rdcstr originalPath = unstrippedPath;
@@ -2762,7 +2823,20 @@ void VulkanCreationInfo::ShaderModule::Reinit()
 
   size_t numSearchPaths = searchPaths.size();
 
+  rdcstr foundFname = originalPath;
   rdcstr foundPath;
+
+  loadingLog = StringFormat::Fmt("Shader filepath '%s'\n", originalPath.c_str());
+  if(numSearchPaths > 0)
+  {
+    loadingLog += rdcstr("\nNon-Recursive Search Path(s):\n");
+    for(size_t i = 0; i < numSearchPaths; i++)
+      loadingLog += StringFormat::Fmt("'%s'\n", searchPaths[i].c_str());
+  }
+  else
+  {
+    loadingLog += rdcstr("\nNo Non-Recursive Search Paths\n");
+  }
 
   // keep searching until we've exhausted all possible path options, or we've found a file that
   // opens
@@ -2774,8 +2848,11 @@ void VulkanCreationInfo::ShaderModule::Reinit()
     {
       if(i == 0)
       {
+        loadingLog += rdcstr("\n");
         originalShaderFile = FileIO::fopen(originalPath, FileIO::ReadBinary);
         foundPath = originalPath;
+        if(originalShaderFile == NULL)
+          loadingLog += StringFormat::Fmt("File not found using filepath '%s'\n", foundPath.c_str());
         continue;
       }
       else
@@ -2783,6 +2860,9 @@ void VulkanCreationInfo::ShaderModule::Reinit()
         const rdcstr &searchPath = searchPaths[i - 1];
         foundPath = searchPath + "/" + originalPath;
         originalShaderFile = FileIO::fopen(foundPath, FileIO::ReadBinary);
+        if(originalShaderFile == NULL)
+          loadingLog += StringFormat::Fmt(
+              "File not found in search directory using filepath '%s'\n", foundPath.c_str());
       }
     }
 
@@ -2804,19 +2884,43 @@ void VulkanCreationInfo::ShaderModule::Reinit()
     }
   }
 
+  // Try to retrieve debug file from the externally referenced files in the capture
+  bytebuf debugBytecode;
   if(originalShaderFile == NULL)
-    return;
-
-  FileIO::fseek64(originalShaderFile, 0L, SEEK_END);
-  uint64_t originalShaderSize = FileIO::ftell64(originalShaderFile);
-  FileIO::fseek64(originalShaderFile, 0, SEEK_SET);
-
   {
-    bytebuf debugBytecode;
+    if(!RenderDoc::Inst().GetTrackedFileData(foundFname, debugBytecode))
+    {
+      loadingLog += StringFormat::Fmt(
+          "\nFile not found in files embedded in the capture using nickname '%s'\n",
+          foundFname.c_str());
+      debugInfoLoadingLog =
+          StringFormat::Fmt("Did not find debug data for '%s'\n\n", foundFname.c_str());
+      if(!loadingLog.empty())
+      {
+        debugInfoLoadingLog += StringFormat::Fmt("Details\n");
+        debugInfoLoadingLog += StringFormat::Fmt("-------\n\n");
+        debugInfoLoadingLog += loadingLog;
+      }
+      return false;
+    }
+    loadingLog += StringFormat::Fmt(
+        "\nFound debug data from files embedded in the capture using nickname '%s'\n",
+        foundFname.c_str());
+  }
+  else
+  {
+    FileIO::fseek64(originalShaderFile, 0L, SEEK_END);
+    uint64_t originalShaderSize = FileIO::ftell64(originalShaderFile);
+    FileIO::fseek64(originalShaderFile, 0, SEEK_SET);
 
     debugBytecode.resize((size_t)originalShaderSize);
     FileIO::fread(&debugBytecode[0], sizeof(byte), (size_t)originalShaderSize, originalShaderFile);
+    FileIO::fclose(originalShaderFile);
+    originalShaderFile = NULL;
+    loadingLog += StringFormat::Fmt("\nFound debug data using filepath '%s'\n", foundPath.c_str());
+  }
 
+  {
     if(lz4)
     {
       rdcarray<byte> decompressed;
@@ -2839,7 +2943,17 @@ void VulkanCreationInfo::ShaderModule::Reinit()
         if(ret < 0)
         {
           RDCERR("Failed to decompress LZ4 data from %s", foundPath.c_str());
-          return;
+          loadingLog +=
+              StringFormat::Fmt("\nFailed to decompress LZ4 data from '%s'\n", foundPath.c_str());
+          debugInfoLoadingLog =
+              StringFormat::Fmt("Did not find debug data for '%s'\n\n", foundFname.c_str());
+          if(!loadingLog.empty())
+          {
+            debugInfoLoadingLog += StringFormat::Fmt("Details\n");
+            debugInfoLoadingLog += StringFormat::Fmt("-------\n\n");
+            debugInfoLoadingLog += loadingLog;
+          }
+          return false;
         }
       }
 
@@ -2857,15 +2971,70 @@ void VulkanCreationInfo::ShaderModule::Reinit()
 
     if(!reflTest.GetSPIRV().empty())
     {
+      if(initialSpirv.isEmpty())
+        initialSpirv = spirv.GetSPIRV();
       spirv = reflTest;
+      RenderDoc::Inst().AddTrackedFileReference(foundFname, foundPath);
+      loadingLog += StringFormat::Fmt("Debug data parsed successfully (%u bytes)\n",
+                                      (uint32_t)debugBytecode.size());
+      debugInfoLoadingLog = StringFormat::Fmt("Found debug data for '%s'\n\n", foundFname.c_str());
+      if(!loadingLog.empty())
+      {
+        debugInfoLoadingLog += StringFormat::Fmt("Details\n");
+        debugInfoLoadingLog += StringFormat::Fmt("-------\n\n");
+        debugInfoLoadingLog += loadingLog;
+      }
+      return true;
+    }
+    else
+    {
+      loadingLog += StringFormat::Fmt("Debug data failed to parse (%u bytes)\n",
+                                      (uint32_t)debugBytecode.size());
+      debugInfoLoadingLog =
+          StringFormat::Fmt("Did not find debug data for '%s'\n\n", foundFname.c_str());
     }
   }
+  if(!loadingLog.empty())
+  {
+    debugInfoLoadingLog += StringFormat::Fmt("Details\n");
+    debugInfoLoadingLog += StringFormat::Fmt("-------\n\n");
+    debugInfoLoadingLog += loadingLog;
+  }
+  return false;
+}
 
-  FileIO::fclose(originalShaderFile);
+void VulkanCreationInfo::ShaderModule::Reload(VulkanResourceManager *resourceMan,
+                                              const VulkanCreationInfo &info, ResourceId id)
+{
+  // Nothing to do if the shader does not have a separate debug info path
+  if(unstrippedPath.empty())
+    return;
+
+  rdcarray<uint32_t> currentSpirv = spirv.GetSPIRV();
+
+  // Loading debug data failed : reset the spirv to the initial spirv
+  if(!Reinit())
+  {
+    if(initialSpirv.isEmpty())
+      return;
+    if(currentSpirv == initialSpirv)
+      return;
+    rdcspv::Reflector newSpirv;
+    newSpirv.Parse(initialSpirv);
+    spirv = newSpirv;
+  }
+
+  // Nothing to do if the shader spirv did not change
+  if(spirv.GetSPIRV() == currentSpirv)
+    return;
+
+  for(auto it = m_Reflections.begin(); it != m_Reflections.end(); ++it)
+    it->second.Reload(resourceMan, info, id, spirv);
 }
 
 void VulkanCreationInfo::ShaderModuleReflection::Init(VulkanResourceManager *resourceMan,
-                                                      ResourceId id, const rdcspv::Reflector &spv,
+                                                      const VulkanCreationInfo &info, ResourceId id,
+                                                      const rdcspv::Reflector &spv,
                                                       const rdcstr &entry,
                                                       VkShaderStageFlagBits stage,
                                                       const rdcarray<SpecConstant> &specInfo)
@@ -2878,14 +3047,31 @@ void VulkanCreationInfo::ShaderModuleReflection::Init(VulkanResourceManager *res
     spv.MakeReflection(GraphicsAPI::Vulkan, ShaderStage(stageIndex), entryPoint, specInfo, *refl,
                        patchData);
 
-    refl->resourceId = resourceMan->GetOriginalID(id);
+    refl->resourceId = id;
+    refl->debugInfo.debugInfoLoadingLog = info.m_ShaderModule.at(id).debugInfoLoadingLog;
+    specConstantData = specInfo;
   }
 }
 
 void VulkanCreationInfo::ShaderModuleReflection::PopulateDisassembly(const rdcspv::Reflector &spirv)
 {
   if(disassembly.empty())
-    disassembly = spirv.Disassemble(refl->entryPoint, instructionLines);
+    disassembly = spirv.Disassemble(refl->entryPoint, specConstantData, instructionLines);
+}
+
+void VulkanCreationInfo::ShaderModuleReflection::Reload(VulkanResourceManager *resourceMan,
+                                                        const VulkanCreationInfo &info,
+                                                        ResourceId id, const rdcspv::Reflector &spv)
+{
+  const rdcstr entry = entryPoint;
+  entryPoint.clear();
+  disassembly.clear();
+  instructionLines.clear();
+  // refl : pointer is stored in other structures, can't delete it
+  *refl = ShaderReflection();
+  patchData = SPIRVPatchData();
+  VkShaderStageFlagBits stage = (VkShaderStageFlagBits)ShaderMaskFromIndex((size_t)(stageIndex));
+  Init(resourceMan, info, id, spv, entry, stage, specConstantData);
 }
 
 void VulkanCreationInfo::QueryPool::Init(VulkanResourceManager *resourceMan, VulkanCreationInfo &info,
@@ -2983,10 +3169,7 @@ void VulkanCreationInfo::DescSetPool::CreateOverflow(VkDevice device,
   VkResult ret = ObjDisp(device)->CreateDescriptorPool(Unwrap(device), &poolInfo, NULL, &pool);
   RDCASSERTEQUAL(ret, VK_SUCCESS);
 
-  ResourceId poolid = resourceMan->WrapResource(Unwrap(device), pool);
-
-  // register as a live-only resource, so it is cleaned up properly
-  resourceMan->AddLiveResource(poolid, pool);
+  ResourceId poolid = resourceMan->WrapResource(ResourceId(), Unwrap(device), pool);
 
   overflow.push_back(pool);
 }

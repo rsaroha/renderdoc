@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2025 Baldur Karlsson
+ * Copyright (c) 2015-2026 Baldur Karlsson
  * Copyright (c) 2014 Crytek
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -27,6 +27,7 @@
 
 #include "apidefs.h"
 #include "rdcarray.h"
+#include "rdcpair.h"
 #include "replay_enums.h"
 #include "resourceid.h"
 #include "stringise.h"
@@ -400,6 +401,161 @@ Invalid values will result in 1 being set.
     return false;
   }
 
+  DOCUMENT(R"(Set PVRTC properties. See :meth:`PVRTCVersion` and :meth:`PVRTCBpp`.
+
+Invalid values will result in undefined format properties. Has no effect if the format is
+not already set to be PVRTC.
+
+:param int version: The PVRTC version.
+:param int bpp: The bits per pixel of the PVRTC blocks.
+)");
+  void SetPVRTC(uint32_t version, uint32_t bpp)
+  {
+    if(type != ResourceFormatType::PVRTC)
+      return;
+
+    flags &= ~ResourceFormat_PVRTC_Mask;
+    flags |= (version == 1) ? ResourceFormat_PVRTC_v1 : ResourceFormat_PVRTC_v2;
+    flags |= (bpp == 2) ? ResourceFormat_PVRTC_8x4_2bpp : ResourceFormat_PVRTC_4x4_4bpp;
+  }
+
+  DOCUMENT(R"(For PVRTC formats, return the version of PVRTC used either 1 or 2.
+
+Will return 0 if the format is not PVRTC.
+
+:return: The version of the current PVRTC format
+:rtype: int
+)");
+  uint32_t PVRTCVersion() const
+  {
+    if(type != ResourceFormatType::PVRTC)
+      return 0;
+
+    return (flags & ResourceFormat_PVRTC_v1) ? 1 : 2;
+  }
+
+  DOCUMENT(R"(For PVRTC formats, return the bits per pixel rate either 2 or 4. This can also be
+thought of as the block shape since each block is 64-bit. 2bpp is 8x4 and 4bpp is 4x4.
+
+Will return 0 if the format is not PVRTC.
+
+:return: The bpp of the current PVRTC format
+:rtype: int
+)");
+  uint32_t PVRTCBpp() const
+  {
+    if(type != ResourceFormatType::PVRTC)
+      return 0;
+
+    return (flags & ResourceFormat_PVRTC_8x4_2bpp) ? 2 : 4;
+  }
+
+  DOCUMENT(R"(Set 2D ASTC block properties. See :meth:`ASTCDimension` and :meth:`ASTC2DBlock`.
+
+Invalid values will result in undefined format properties. Has no effect if the format is
+not already set to be ASTC.
+
+:param Tuple[int, int] block2D: The 2D block shape.
+)");
+  void SetASTC2D(const rdcpair<uint32_t, uint32_t> &block2D)
+  {
+    if(type != ResourceFormatType::ASTC)
+      return;
+
+    flags &= ~ResourceFormat_ASTC_Mask;
+
+    flags |= uint16_t(block2D.first << ResourceFormat_ASTC_2DWidth_Shift);
+    flags |= uint16_t(block2D.second << ResourceFormat_ASTC_2DHeight_Shift);
+  }
+
+  DOCUMENT(R"(Set 3D ASTC block properties. See :meth:`ASTCDimension` and :meth:`ASTC3DBlock`.
+
+Invalid values will result in undefined format properties. Has no effect if the format is
+not already set to be ASTC.
+
+:param Tuple[int, int, int] block3D: The 3D block shape.
+)");
+  void SetASTC3D(const rdcfixedarray<uint32_t, 3> &block3D)
+  {
+    if(type != ResourceFormatType::ASTC)
+      return;
+
+    flags &= ~ResourceFormat_ASTC_Mask;
+    flags |= ResourceFormat_ASTC_3D;
+
+    uint32_t w = block3D[0] - ResourceFormat_ASTC_3D_Base;
+    uint32_t h = block3D[1] - ResourceFormat_ASTC_3D_Base;
+    uint32_t d = block3D[2] - ResourceFormat_ASTC_3D_Base;
+
+    w <<= ResourceFormat_ASTC_3DWidth_Shift;
+    h <<= ResourceFormat_ASTC_3DHeight_Shift;
+    d <<= ResourceFormat_ASTC_3DDepth_Shift;
+
+    w &= ResourceFormat_ASTC_3DWidth_Mask;
+    h &= ResourceFormat_ASTC_3DHeight_Mask;
+    d &= ResourceFormat_ASTC_3DDepth_Mask;
+
+    flags |= uint16_t(w);
+    flags |= uint16_t(h);
+    flags |= uint16_t(d);
+  }
+
+  DOCUMENT(R"(For ASTC formats, return the dimension of the block either 2 or 3.
+
+Will return 0 if the format is not ASTC.
+
+:return: The dimension of the blocks in the current ASTC format
+:rtype: int
+)");
+  uint32_t ASTCDimension() const
+  {
+    if(type != ResourceFormatType::ASTC)
+      return 0;
+
+    return (flags & ResourceFormat_ASTC_3D) ? 3 : 2;
+  }
+
+  DOCUMENT(R"(For 2D ASTC formats, return the block shape.
+
+Will return all 0s if the format is not ASTC or is not 2D. See :meth:`ASTCDimension`.
+
+:return: The block shape if the format is 2D ASTC
+:rtype: Tuple[int, int]
+)");
+  rdcpair<uint32_t, uint32_t> ASTC2DBlock() const
+  {
+    if(type != ResourceFormatType::ASTC)
+      return {0, 0};
+
+    return {
+        uint32_t((flags & ResourceFormat_ASTC_2DWidth_Mask) >> ResourceFormat_ASTC_2DWidth_Shift),
+        uint32_t((flags & ResourceFormat_ASTC_2DHeight_Mask) >> ResourceFormat_ASTC_2DHeight_Shift),
+    };
+  }
+
+  DOCUMENT(R"(For 3D ASTC formats, return the block shape.
+
+Will return all 0s if the format is not ASTC or is not 3D. See :meth:`ASTCDimension`.
+
+:return: The block shape if the format is 3D ASTC
+:rtype: Tuple[int, int, int]
+)");
+  rdcfixedarray<uint32_t, 3> ASTC3DBlock() const
+  {
+    if(type != ResourceFormatType::ASTC)
+      return {0, 0};
+
+    uint32_t w = (flags & ResourceFormat_ASTC_3DWidth_Mask) >> ResourceFormat_ASTC_3DWidth_Shift;
+    uint32_t h = (flags & ResourceFormat_ASTC_3DHeight_Mask) >> ResourceFormat_ASTC_3DHeight_Shift;
+    uint32_t d = (flags & ResourceFormat_ASTC_3DDepth_Mask) >> ResourceFormat_ASTC_3DDepth_Shift;
+
+    return {
+        ResourceFormat_ASTC_3D_Base + w,
+        ResourceFormat_ASTC_3D_Base + h,
+        ResourceFormat_ASTC_3D_Base + d,
+    };
+  }
+
   DOCUMENT(R"(Return the size of a single element in this format, usually a pixel. For regular sized
 formats this is just :data:`compByteWidth` times :data:`compCount`, for special packed formats it's
 the tightly packed size of a single element, with no padding.
@@ -454,7 +610,7 @@ texel.
       case ResourceFormatType::YUV12:
       case ResourceFormatType::YUV16: return compCount * 2;
       case ResourceFormatType::PVRTC:
-        return 8;    // our representation can't differentiate 2bpp from 4bpp, so guess
+        return 8;    // PVRTC is always 64 bits per block, either 4x4 on 4bpp or 8x4 on 2bpp
     }
 
     return 0;
@@ -487,6 +643,7 @@ private:
   enum
   {
     ResourceFormat_BGRA = 0x001,
+    ResourceFormat_ASTC_3D = 0x0002,
 
     ResourceFormat_444 = 0x004,
     ResourceFormat_422 = 0x008,
@@ -496,6 +653,27 @@ private:
     ResourceFormat_2Planes = 0x020,
     ResourceFormat_3Planes = 0x040,
     ResourceFormat_Planes_Mask = 0x060,
+
+    ResourceFormat_PVRTC_v1 = 0x0100,
+    ResourceFormat_PVRTC_v2 = 0x0200,
+    ResourceFormat_PVRTC_4x4_4bpp = 0x0400,
+    ResourceFormat_PVRTC_8x4_2bpp = 0x0800,
+    ResourceFormat_PVRTC_Mask = 0x0f00,
+
+    ResourceFormat_ASTC_2DWidth_Shift = 8,
+    ResourceFormat_ASTC_2DWidth_Mask = (0xf << ResourceFormat_ASTC_2DWidth_Shift),
+    ResourceFormat_ASTC_2DHeight_Shift = 12,
+    ResourceFormat_ASTC_2DHeight_Mask = (0xf << ResourceFormat_ASTC_2DHeight_Shift),
+
+    ResourceFormat_ASTC_3D_Base = 3,
+    ResourceFormat_ASTC_3DWidth_Shift = 10,
+    ResourceFormat_ASTC_3DWidth_Mask = (0x3 << ResourceFormat_ASTC_3DWidth_Shift),
+    ResourceFormat_ASTC_3DHeight_Shift = 12,
+    ResourceFormat_ASTC_3DHeight_Mask = (0x3 << ResourceFormat_ASTC_3DHeight_Shift),
+    ResourceFormat_ASTC_3DDepth_Shift = 14,
+    ResourceFormat_ASTC_3DDepth_Mask = (0x3 << ResourceFormat_ASTC_3DDepth_Shift),
+
+    ResourceFormat_ASTC_Mask = 0xff00,
   };
   uint16_t flags;
 
@@ -668,6 +846,13 @@ typically it is one parent to many derived.
 :type: List[ResourceId]
 )");
   rdcarray<ResourceId> parentResources;
+
+  DOCUMENT(R"(An optional set of annotations associated with this resource, may be ``None`` if
+annotations are not used.
+
+:type: SDObject
+)");
+  SDObject *annotations = NULL;
 
   DOCUMENT(R"(Utility function for setting up a custom name to overwrite the auto-generated one.
 
@@ -963,6 +1148,13 @@ markers added to the capture after load.
 :type: int
 )");
   uint64_t fileOffset = 0;
+
+  DOCUMENT(R"(An optional set of annotations associated with this event, may be ``None`` if
+annotations are not used.
+
+:type: SDObject
+)");
+  SDObject *annotations = NULL;
 
   static const uint32_t NoChunk = ~0U;
 };
@@ -1855,6 +2047,12 @@ this counts the frame number when the capture was made.
 )");
   rdcarray<DebugMessage> debugMessages;
 
+  DOCUMENT(R"(Whether or not the capture contains any annotations.
+
+:type: bool
+)");
+  bool containsAnnotations = false;
+
   static const uint32_t NoFrameNumber = ~0U;
 };
 
@@ -1868,7 +2066,6 @@ struct EventUsage
   EventUsage() : eventId(0), usage(ResourceUsage::Unused) {}
   EventUsage(const EventUsage &) = default;
   EventUsage(uint32_t e, ResourceUsage u) : eventId(e), usage(u) {}
-  EventUsage(uint32_t e, ResourceUsage u, ResourceId v) : eventId(e), usage(u), view(v) {}
   EventUsage &operator=(const EventUsage &) = default;
   bool operator<(const EventUsage &o) const
   {
@@ -1890,12 +2087,6 @@ struct EventUsage
 :type: ResourceUsage
 )");
   ResourceUsage usage;
-
-  DOCUMENT(R"(An optional :class:`ResourceId` identifying the view through which the use happened.
-
-:type: ResourceId
-)");
-  ResourceId view;
 };
 
 DECLARE_REFLECTION_STRUCT(EventUsage);
@@ -2535,17 +2726,26 @@ struct ModificationValue
   }
   DOCUMENT(R"(The color value.
 
+If the modifications are for a color target, tthe contents will all be ``0``.
+
 :type: PixelValue
 )");
   PixelValue col;
 
-  DOCUMENT(R"(The depth output, as a ``float``.
+  DOCUMENT(R"(The depth value.
+
+If depth is not available/in-use for this modification, it will be ``-1.0``.
 
 :type: float
 )");
   float depth;
 
-  DOCUMENT(R"(The stencil output, or ``-1`` if not available.
+  DOCUMENT(R"(The stencil value.
+
+If stencil is not available for this modification, it will be negative. If stencil is not available
+at all and not in use then the stencil value will be ``-1``. If stencil was in use but can't be
+determined due to the pixel history implementation using stencil for its own purposes, the value
+will be ``-2``. This will only happen when looking at multiple modifications from the same event.
 
 :type: int
 )");
@@ -2636,7 +2836,11 @@ struct PixelModification
 )");
   bool directShaderWrite;
 
-  DOCUMENT(R"(``True`` if no pixel shader was bound at this event.
+  DOCUMENT(R"(``True`` if no pixel shader was bound at this event. On D3D APIs this may also mean
+a pixel shader exists but declares no output for the corresponding target and so is skipped.
+
+On other APIs this is only reported if the pixel shader is entirely unbound but this means the
+output may have undefined values.
 
 :type: bool
 )");
@@ -2735,6 +2939,51 @@ pixel.
     return !sampleMasked && !backfaceCulled && !depthClipped && !depthBoundsFailed &&
            !viewClipped && !scissorClipped && !shaderDiscarded && !depthTestFailed &&
            !stencilTestFailed && !predicationSkipped;
+  }
+
+  DOCUMENT(R"(Update the depth-test failure state based on known shader output depth value and
+preMod reference value, quantised to a certain number of depth bits with epsilon.
+
+This is primarily used internally and should not be needed to be called externally.
+
+:param int depthBits: How many bits are in the depth buffer: 16, 24 or 32.
+:param CompareFunction depthFunc: The comparison function active for the depth test
+)");
+  void CheckDepthTestQuantised(uint32_t depthBits, CompareFunction depthFunc)
+  {
+    float shadDepth = shaderOut.depth;
+    const float compareDepth = preMod.depth;
+
+    float eps = 1.2e-7f;
+    if(depthBits == 24)
+    {
+      shadDepth = float(uint32_t(float(shadDepth * 0xffffff))) / float(0xffffff);
+      eps = float(1.0f) / float(0xffffff);
+    }
+    else if(depthBits == 16)
+    {
+      shadDepth = float(uint32_t(float(shadDepth * 0xffff))) / float(0xffff);
+      eps = float(1.0f) / float(0xffff);
+    }
+
+    bool passed = true;
+    if(depthFunc == CompareFunction::Equal)
+      passed = shadDepth > compareDepth ? ((shadDepth - compareDepth) <= eps)
+                                        : ((compareDepth - shadDepth) <= eps);
+    else if(depthFunc == CompareFunction::NotEqual)
+      passed = shadDepth > compareDepth ? ((shadDepth - compareDepth) > eps)
+                                        : ((compareDepth - shadDepth) > eps);
+    else if(depthFunc == CompareFunction::Less)
+      passed = (shadDepth - eps < compareDepth);
+    else if(depthFunc == CompareFunction::LessEqual)
+      passed = (shadDepth - eps <= compareDepth);
+    else if(depthFunc == CompareFunction::Greater)
+      passed = (shadDepth + eps > compareDepth);
+    else if(depthFunc == CompareFunction::GreaterEqual)
+      passed = (shadDepth + eps >= compareDepth);
+
+    if(!passed)
+      depthTestFailed = true;
   }
 };
 

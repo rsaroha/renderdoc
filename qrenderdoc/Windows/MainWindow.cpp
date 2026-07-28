@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2025 Baldur Karlsson
+ * Copyright (c) 2015-2026 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -130,6 +130,8 @@ MainWindow::MainWindow(ICaptureContext &ctx) : QMainWindow(NULL), ui(new Ui::Mai
   qApp->installEventFilter(this);
 
   setAcceptDrops(true);
+
+  QObject::connect(ui->menu_Tools, &QMenu::aboutToShow, this, &MainWindow::updateToolsMenuOptions);
 
   QObject::connect(ui->action_Load_Default_Layout, &QAction::triggered, this,
                    &MainWindow::loadLayout_triggered);
@@ -445,6 +447,8 @@ MainWindow::MainWindow(ICaptureContext &ctx) : QMainWindow(NULL), ui(new Ui::Mai
   ui->action_Resolve_Symbols->setText(tr("Resolve Symbols"));
 
   ui->action_Recompress_Capture->setEnabled(false);
+  ui->action_EmbedExternalFiles->setEnabled(false);
+  ui->action_RemoveExternalFiles->setEnabled(false);
 
 #if defined(Q_OS_WIN32)
 #define SELF_HOST_NAME "rdocself.dll"
@@ -675,6 +679,8 @@ void MainWindow::captureModified()
   // enabled if this capture was a temporary one
   if(m_Ctx.IsCaptureLoaded())
     ui->action_Save_Capture_Inplace->setEnabled(true);
+
+  updateToolsMenuOptions();
 }
 
 void MainWindow::LoadFromFilename(const QString &filename, bool temporary)
@@ -2238,10 +2244,20 @@ void MainWindow::OnCaptureLoaded()
   bool is_image = driver == lit("Image");
   ui->action_Recompress_Capture->setEnabled(!is_image);
 
+  updateToolsMenuOptions();
+
   ui->action_Start_Replay_Loop->setEnabled(true);
-  ui->action_Open_RGP_Profile->setEnabled(
-      m_Ctx.Replay().GetCaptureAccess()->FindSectionByType(SectionType::AMDRGPProfile) >= 0);
+
+  ui->action_Open_RGP_Profile->setEnabled(false);
   ui->action_Create_RGP_Profile->setEnabled(m_Ctx.APIProps().rgpCapture && m_Ctx.IsCaptureLocal());
+  m_Ctx.Replay().AsyncInvoke([this](IReplayController *) {
+    bool hasAMDGRPPorfile =
+        (m_Ctx.Replay().GetCaptureAccess()->FindSectionByType(SectionType::AMDRGPProfile) >= 0);
+
+    GUIInvoke::call(this, [this, hasAMDGRPPorfile]() {
+      ui->action_Open_RGP_Profile->setEnabled(hasAMDGRPPorfile);
+    });
+  });
 
   setCaptureHasErrors(!m_Ctx.DebugMessages().empty());
 
@@ -2263,6 +2279,15 @@ void MainWindow::OnCaptureLoaded()
 
   if(m_Ctx.HasEventBrowser())
     ToolWindowManager::raiseToolWindow(m_Ctx.GetEventBrowser()->Widget());
+
+  // the first time we load a capture with annotations, show/bring the annotation viewer to the
+  // front. After that, if the user hides it we won't show it again.
+  if(!m_Ctx.Config().Annotations_HasAutoShown && m_Ctx.FrameInfo().containsAnnotations)
+  {
+    m_Ctx.ShowAnnotationViewer();
+    m_Ctx.Config().Annotations_HasAutoShown = true;
+    ToolWindowManager::raiseToolWindow(m_Ctx.GetAnnotationViewer()->Widget());
+  }
 }
 
 void MainWindow::OnCaptureClosed()
@@ -2286,6 +2311,8 @@ void MainWindow::OnCaptureClosed()
   ui->action_Resolve_Symbols->setText(tr("Resolve Symbols"));
 
   ui->action_Recompress_Capture->setEnabled(false);
+  ui->action_EmbedExternalFiles->setEnabled(false);
+  ui->action_RemoveExternalFiles->setEnabled(false);
 
   SetTitle();
 
@@ -2490,6 +2517,38 @@ void MainWindow::on_action_API_Inspector_triggered()
   }
 }
 
+void MainWindow::on_action_Annotation_Viewer_triggered()
+{
+  QWidget *annotViewer = m_Ctx.GetAnnotationViewer()->Widget();
+
+  if(ui->toolWindowManager->toolWindows().contains(annotViewer))
+  {
+    ToolWindowManager::raiseToolWindow(annotViewer);
+  }
+  else
+  {
+    if(m_Ctx.HasAPIInspector() &&
+       ui->toolWindowManager->toolWindows().contains(m_Ctx.GetAPIInspector()->Widget()))
+    {
+      ToolWindowManager::AreaReference ref(
+          ToolWindowManager::AddTo, ui->toolWindowManager->areaOf(m_Ctx.GetAPIInspector()->Widget()));
+      ui->toolWindowManager->addToolWindow(annotViewer, ref);
+    }
+    else if(m_Ctx.HasEventBrowser() &&
+            ui->toolWindowManager->toolWindows().contains(m_Ctx.GetEventBrowser()->Widget()))
+    {
+      ToolWindowManager::AreaReference ref(
+          ToolWindowManager::BottomOf,
+          ui->toolWindowManager->areaOf(m_Ctx.GetEventBrowser()->Widget()));
+      ui->toolWindowManager->addToolWindow(annotViewer, ref);
+    }
+    else
+    {
+      ui->toolWindowManager->addToolWindow(annotViewer, leftToolArea());
+    }
+  }
+}
+
 void MainWindow::on_action_Event_Browser_triggered()
 {
   QWidget *eventBrowser = m_Ctx.GetEventBrowser()->Widget();
@@ -2636,6 +2695,16 @@ void MainWindow::on_action_Resolve_Symbols_triggered()
 void MainWindow::on_action_Recompress_Capture_triggered()
 {
   m_Ctx.RecompressCapture();
+}
+
+void MainWindow::on_action_EmbedExternalFiles_triggered()
+{
+  m_Ctx.EmbedDependentFiles();
+}
+
+void MainWindow::on_action_RemoveExternalFiles_triggered()
+{
+  m_Ctx.RemoveDependentFiles();
 }
 
 void MainWindow::on_action_Start_Replay_Loop_triggered()
@@ -2993,6 +3062,22 @@ void MainWindow::saveLayout_triggered()
 void MainWindow::loadLayout_triggered()
 {
   LoadSaveLayout(qobject_cast<QAction *>(QObject::sender()), false);
+}
+
+void MainWindow::updateToolsMenuOptions()
+{
+  if(m_Ctx.Replay().GetCaptureAccess())
+  {
+    m_Ctx.Replay().AsyncInvoke([this](IReplayController *) {
+      bool hasEmbeddedDependencies = m_Ctx.Replay().GetCaptureAccess()->HasEmbeddedDependencies();
+      bool hasPendingDependencies = m_Ctx.Replay().GetCaptureAccess()->HasPendingDependencies();
+
+      GUIInvoke::call(this, [this, hasEmbeddedDependencies, hasPendingDependencies]() {
+        ui->action_EmbedExternalFiles->setEnabled(!hasEmbeddedDependencies && hasPendingDependencies);
+        ui->action_RemoveExternalFiles->setEnabled(hasEmbeddedDependencies);
+      });
+    });
+  }
 }
 
 void MainWindow::closeEvent(QCloseEvent *event)

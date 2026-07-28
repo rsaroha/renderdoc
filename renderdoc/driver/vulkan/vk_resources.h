@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2025 Baldur Karlsson
+ * Copyright (c) 2015-2026 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -861,7 +861,9 @@ inline void SetTableIfDispatchable(bool writing, VkDevice parent, WrappedVulkan 
 }
 
 bool IsDispatchableRes(WrappedVkRes *ptr);
+bool IsDispatchableRes(VkResourceType type);
 bool IsPostponableRes(const WrappedVkRes *ptr);
+VkResourceType TryIdentifyTypeByPtr(WrappedVkRes *ptr);
 VkResourceType IdentifyTypeByPtr(WrappedVkRes *ptr);
 
 #define UNKNOWN_PREV_IMG_LAYOUT ((VkImageLayout)0xffffffff)
@@ -947,7 +949,7 @@ struct ImageInfo
     }
     aspects = FormatImageAspects(format);
 
-    if(ci.usage & VK_IMAGE_USAGE_STORAGE_BIT)
+    if(GetImageUsageFlags(&ci) & VK_IMAGE_USAGE_STORAGE_BIT)
     {
       storage = true;
     }
@@ -2404,8 +2406,8 @@ public:
   ResourceId baseResource;
   ResourceId baseResourceMem;    // for image views, we need to point to both the image and mem
 
-  VkDeviceSize memOffset;
-  VkDeviceSize memSize;
+  VkDeviceSize memOffset = 0ULL;
+  VkDeviceSize memSize = 0ULL;
   VkResourceType resType;
   bool storable = false;
   bool dedicated = false;
@@ -2625,6 +2627,9 @@ struct BlockShape
 
   // the number of bytes used to encode the block
   uint32_t bytes;
+
+  // the depth, for 3D ASTC only
+  uint32_t depth;
 };
 
 BlockShape GetBlockShape(VkFormat Format, uint32_t plane);

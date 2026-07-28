@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2025 Baldur Karlsson
+ * Copyright (c) 2019-2026 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -825,6 +825,15 @@ float4 main(v2f IN) : SV_Target0
   if(IN.tri == 98)
   {
     return float4(col1z, col2w, 1.0, 2.0);
+  }
+  if(IN.tri == 99)
+  {
+    float4 Color = float4(0,0,0,1);
+    float2 uv = IN.pos.xy / float2(2.0, 2.0);
+    uv.y += 0.187;
+    Color.x = smiley.CalculateLevelOfDetail(linearclamp, uv);
+    Color.y = smiley.CalculateLevelOfDetailUnclamped(linearclamp, uv);
+    return Color;
   }
 
   return float4(0.4f, 0.4f, 0.4f, 0.4f);

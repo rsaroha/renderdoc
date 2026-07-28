@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2020-2025 Baldur Karlsson
+ * Copyright (c) 2020-2026 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -258,6 +258,13 @@ float4 main(v2f IN) : SV_Target0
     tests.push_back(BuildTestCase({{false, VarType::UInt, 3, 1, "TEXCOORD0", true}}));
     tests.push_back(BuildTestCase({{false, VarType::UInt, 4, 1, "TEXCOORD0", true}}));
 
+    // something that looks like an array but isn't
+    tests.push_back(BuildTestCase({
+        {false, VarType::Float, 2, 1, "TEXCOORD0", true},
+        {false, VarType::Float, 2, 1, "OTHER", true},
+        {false, VarType::Float, 2, 1, "TEXCOORD1", true},
+    }));
+
     // float2 array with an extra float2
     tests.push_back(BuildTestCase({{false, VarType::Float, 2, 5, "TEXCOORD0", true},
                                    {false, VarType::Float, 2, 0, "OTHER", true}}));
@@ -340,6 +347,21 @@ float4 main(v2f IN) : SV_Target0
     // them in the wrong registers
     tests.push_back(BuildTestCase({{true, VarType::Float, 1, 0, "TEXCOORD0", true},
                                    {false, VarType::UInt, 1, 0, "TEXCOORD1", true}}));
+
+    // Packing float with a float3
+    tests.push_back(BuildTestCase({{false, VarType::Float, 1, 0, "TEXCOORD0", true},
+                                   {true, VarType::UInt, 1, 0, "TEXCOORD1", true},
+                                   {false, VarType::Float, 3, 0, "COLOR", true}}));
+
+    // Packing float with a float3[1]
+    tests.push_back(BuildTestCase({{false, VarType::Float, 1, 0, "TEXCOORD0", true},
+                                   {true, VarType::UInt, 1, 0, "TEXCOORD1", true},
+                                   {false, VarType::Float, 3, 1, "COLOR", true}}));
+
+    // Not packing float with a float3[2]
+    tests.push_back(BuildTestCase({{false, VarType::Float, 1, 0, "TEXCOORD0", true},
+                                   {true, VarType::UInt, 1, 0, "TEXCOORD1", true},
+                                   {false, VarType::Float, 3, 2, "COLOR", true}}));
 
     // Bespoke tests for broken scenarios discovered through bug reports:
 

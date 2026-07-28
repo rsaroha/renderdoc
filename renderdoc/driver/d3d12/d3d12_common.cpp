@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2025 Baldur Karlsson
+ * Copyright (c) 2016-2026 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -541,6 +541,24 @@ bool D3D12InitParams::IsSupportedVersion(uint64_t ver)
   if(ver == 0x13)
     return true;
 
+  // 0x14 -> 0x15 - Add serialisation of new root signature blob in PSO desc
+  if(ver == 0x14)
+    return true;
+
+  // 0x15 -> 0x16 - added IDs generated at capture time for shaders in pipelines
+  if(ver == 0x15)
+    return true;
+
+  // 0x16 -> 0x17 - added serialised annotations
+  if(ver == 0x16)
+    return true;
+
+  // 0x17 -> 0x20 - converted serialised page table to be 64-bit
+  //                version jump was to match vulkan version, as page table is agnostic.
+  //                Version numbers are arbitrary and just have to be increasing
+  if(ver == 0x17)
+    return true;
+
   return false;
 }
 
@@ -629,7 +647,7 @@ TextureType MakeTextureDim(D3D12_SRV_DIMENSION dim)
     case D3D12_SRV_DIMENSION_TEXTURE3D: return TextureType::Texture3D;
     case D3D12_SRV_DIMENSION_TEXTURECUBE: return TextureType::TextureCube;
     case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY: return TextureType::TextureCubeArray;
-    default: break;
+    case D3D12_SRV_DIMENSION_BUFFER_BYTE_OFFSET: return TextureType::Buffer;
   }
 
   return TextureType::Unknown;
@@ -648,7 +666,6 @@ TextureType MakeTextureDim(D3D12_RTV_DIMENSION dim)
     case D3D12_RTV_DIMENSION_TEXTURE2DMS: return TextureType::Texture2DMS;
     case D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY: return TextureType::Texture2DMSArray;
     case D3D12_RTV_DIMENSION_TEXTURE3D: return TextureType::Texture3D;
-    default: break;
   }
 
   return TextureType::Unknown;
@@ -665,7 +682,6 @@ TextureType MakeTextureDim(D3D12_DSV_DIMENSION dim)
     case D3D12_DSV_DIMENSION_TEXTURE2DARRAY: return TextureType::Texture2DArray;
     case D3D12_DSV_DIMENSION_TEXTURE2DMS: return TextureType::Texture2DMS;
     case D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY: return TextureType::Texture2DMSArray;
-    default: break;
   }
 
   return TextureType::Unknown;
@@ -684,7 +700,7 @@ TextureType MakeTextureDim(D3D12_UAV_DIMENSION dim)
     case D3D12_UAV_DIMENSION_TEXTURE2DMS: return TextureType::Texture2DMS;
     case D3D12_UAV_DIMENSION_TEXTURE2DMSARRAY: return TextureType::Texture2DMSArray;
     case D3D12_UAV_DIMENSION_TEXTURE3D: return TextureType::Texture3D;
-    default: break;
+    case D3D12_UAV_DIMENSION_BUFFER_BYTE_OFFSET: return TextureType::Buffer;
   }
 
   return TextureType::Unknown;
@@ -699,7 +715,6 @@ AddressMode MakeAddressMode(D3D12_TEXTURE_ADDRESS_MODE addr)
     case D3D12_TEXTURE_ADDRESS_MODE_CLAMP: return AddressMode::ClampEdge;
     case D3D12_TEXTURE_ADDRESS_MODE_BORDER: return AddressMode::ClampBorder;
     case D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE: return AddressMode::MirrorOnce;
-    default: break;
   }
 
   return AddressMode::Wrap;
@@ -718,7 +733,6 @@ CompareFunction MakeCompareFunc(D3D12_COMPARISON_FUNC func)
     case D3D12_COMPARISON_FUNC_NOT_EQUAL: return CompareFunction::NotEqual;
     case D3D12_COMPARISON_FUNC_GREATER_EQUAL: return CompareFunction::GreaterEqual;
     case D3D12_COMPARISON_FUNC_ALWAYS: return CompareFunction::AlwaysTrue;
-    default: break;
   }
 
   return CompareFunction::AlwaysTrue;
@@ -1596,6 +1610,7 @@ struct D3D12_PTR_PSO_SUBOBJECT
     D3D12_INPUT_LAYOUT_DESC InputLayout;
     D3D12_CACHED_PIPELINE_STATE CachedPSO;
     D3D12_VIEW_INSTANCING_DESC ViewInstancing;
+    D3D12_SERIALIZED_ROOT_SIGNATURE_DESC RootSig;
   } data;
 };
 
@@ -1710,6 +1725,12 @@ D3D12_EXPANDED_PIPELINE_STATE_STREAM_DESC::D3D12_EXPANDED_PIPELINE_STATE_STREAM_
       {
         pRootSignature = ptr->data.pRootSignature;
         ITER_ADV(ID3D12RootSignature *);
+        break;
+      }
+      case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SERIALIZED_ROOT_SIGNATURE:
+      {
+        RootSigBlob = ptr->data.RootSig;
+        ITER_ADV(D3D12_SERIALIZED_ROOT_SIGNATURE_DESC);
         break;
       }
       case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS:
@@ -1921,26 +1942,66 @@ D3D12_EXPANDED_PIPELINE_STATE_STREAM_DESC::D3D12_EXPANDED_PIPELINE_STATE_STREAM_
   }
 }
 
+ID3D12RootSignature *D3D12_EXPANDED_PIPELINE_STATE_STREAM_DESC::GetOrCreateRootSig(
+    WrappedID3D12Device *dev)
+{
+  if(pRootSignature == NULL && RootSigBlob.SerializedBlobSizeInBytes > 0)
+  {
+    pRootSignature = dev->CreateImplicitRootSig(RootSigBlob);
+    RootSigBlob = {};
+  }
+
+  return pRootSignature;
+}
+
 void D3D12_PACKED_PIPELINE_STATE_STREAM_DESC::Unwrap()
 {
-  m_GraphicsStreamData.pRootSignature = ::Unwrap(m_GraphicsStreamData.pRootSignature);
-  m_ComputeStreamData.pRootSignature = ::Unwrap(m_ComputeStreamData.pRootSignature);
+  *m_RootSigToUnwrap = ::Unwrap(*m_RootSigToUnwrap);
 }
 
 D3D12_PACKED_PIPELINE_STATE_STREAM_DESC &D3D12_PACKED_PIPELINE_STATE_STREAM_DESC::operator=(
     const D3D12_EXPANDED_PIPELINE_STATE_STREAM_DESC &expanded)
 {
+#define WRITE_VERSIONED_SUBOJBECT(subobjType, subobj) \
+  type = subobjType;                                  \
+  memcpy(ptr, &type, sizeof(type));                   \
+  ptr += sizeof(type);                                \
+  ptr = AlignUpPtr(ptr, alignof(decltype(subobj)));   \
+  memcpy(ptr, &subobj, sizeof(subobj));               \
+  ptr += sizeof(subobj);                              \
+  ptr = AlignUpPtr(ptr, sizeof(void *));
+
   if(expanded.CS.BytecodeLength > 0)
   {
-    m_ComputeStreamData.pRootSignature = expanded.pRootSignature;
     m_ComputeStreamData.CS = expanded.CS;
     m_ComputeStreamData.NodeMask = expanded.NodeMask;
     m_ComputeStreamData.CachedPSO = expanded.CachedPSO;
     m_ComputeStreamData.Flags = expanded.Flags;
+
+    byte *ptr = m_ComputeStreamData.VariableVersionedData;
+    const byte *start = ptr;
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type;
+
+    D3D12_SERIALIZED_ROOT_SIGNATURE_DESC RootSigBlob = expanded.GetRootSigBlob();
+    if(RootSigBlob.SerializedBlobSizeInBytes > 0)
+    {
+      WRITE_VERSIONED_SUBOJBECT(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SERIALIZED_ROOT_SIGNATURE,
+                                RootSigBlob);
+
+      m_RootSigToUnwrap = NULL;
+    }
+    else
+    {
+      ID3D12RootSignature *sig = expanded.GetRootSigIfPresent();
+      WRITE_VERSIONED_SUBOJBECT(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, sig);
+
+      m_RootSigToUnwrap = ((ID3D12RootSignature **)ptr) - 1;
+    }
+
+    m_VariableVersionedDataLength = ptr - start;
   }
   else
   {
-    m_GraphicsStreamData.pRootSignature = expanded.pRootSignature;
     m_GraphicsStreamData.VS = expanded.VS;
     m_GraphicsStreamData.PS = expanded.PS;
     m_GraphicsStreamData.DS = expanded.DS;
@@ -1966,14 +2027,21 @@ D3D12_PACKED_PIPELINE_STATE_STREAM_DESC &D3D12_PACKED_PIPELINE_STATE_STREAM_DESC
     const byte *start = ptr;
     D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type;
 
-#define WRITE_VERSIONED_SUBOJBECT(subobjType, subobj) \
-  type = subobjType;                                  \
-  memcpy(ptr, &type, sizeof(type));                   \
-  ptr += sizeof(type);                                \
-  ptr = AlignUpPtr(ptr, alignof(decltype(subobj)));   \
-  memcpy(ptr, &subobj, sizeof(subobj));               \
-  ptr += sizeof(subobj);                              \
-  ptr = AlignUpPtr(ptr, sizeof(void *));
+    D3D12_SERIALIZED_ROOT_SIGNATURE_DESC RootSigBlob = expanded.GetRootSigBlob();
+    if(RootSigBlob.SerializedBlobSizeInBytes > 0)
+    {
+      WRITE_VERSIONED_SUBOJBECT(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SERIALIZED_ROOT_SIGNATURE,
+                                RootSigBlob);
+
+      m_RootSigToUnwrap = NULL;
+    }
+    else
+    {
+      ID3D12RootSignature *sig = expanded.GetRootSigIfPresent();
+      WRITE_VERSIONED_SUBOJBECT(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, sig);
+
+      m_RootSigToUnwrap = ((ID3D12RootSignature **)ptr) - 1;
+    }
 
     // is the line rasterization mode narrow quadrilateral? if so we need version 2.
     if(expanded.RasterizerState.LineRasterizationMode ==

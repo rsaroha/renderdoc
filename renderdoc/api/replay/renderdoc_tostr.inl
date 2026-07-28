@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2017-2025 Baldur Karlsson
+ * Copyright (c) 2017-2026 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -322,6 +322,18 @@ rdcstr DoStringise(const CullMode &el)
     STRINGISE_ENUM_CLASS_NAMED(Front, "Front");
     STRINGISE_ENUM_CLASS_NAMED(Back, "Back");
     STRINGISE_ENUM_CLASS_NAMED(FrontAndBack, "Front & Back");
+  }
+  END_ENUM_STRINGISE();
+}
+
+template <>
+rdcstr DoStringise(const DepthBiasMode &el)
+{
+  BEGIN_ENUM_STRINGISE(DepthBiasMode)
+  {
+    STRINGISE_ENUM_CLASS(Default);
+    STRINGISE_ENUM_CLASS(ForceUNorm);
+    STRINGISE_ENUM_CLASS(One);
   }
   END_ENUM_STRINGISE();
 }
@@ -731,6 +743,7 @@ rdcstr DoStringise(const DescriptorType &el)
     STRINGISE_ENUM_CLASS_NAMED(Sampler, "Sampler");
     STRINGISE_ENUM_CLASS_NAMED(ImageSampler, "Image & Sampler");
     STRINGISE_ENUM_CLASS_NAMED(Image, "Image");
+    STRINGISE_ENUM_CLASS_NAMED(Buffer, "Buffer");
     STRINGISE_ENUM_CLASS_NAMED(TypedBuffer, "Typed Buffer");
     STRINGISE_ENUM_CLASS_NAMED(ReadWriteImage, "RW Image");
     STRINGISE_ENUM_CLASS_NAMED(ReadWriteTypedBuffer, "RW Typed Buffer");
@@ -1128,6 +1141,7 @@ rdcstr DoStringise(const SectionType &el)
     STRINGISE_ENUM_CLASS_NAMED(EditedShaders, "renderdoc/ui/edits");
     STRINGISE_ENUM_CLASS_NAMED(D3D12Core, "renderdoc/internal/d3d12core");
     STRINGISE_ENUM_CLASS_NAMED(D3D12SDKLayers, "renderdoc/internal/d3d12sdklayers");
+    STRINGISE_ENUM_CLASS_NAMED(EmbeddedExternalFiles, "renderdoc/internal/embeddedexternalfiles");
   }
   END_ENUM_STRINGISE();
 }
@@ -1209,6 +1223,7 @@ rdcstr DoStringise(const ShaderVariableFlags &el)
     STRINGISE_BITFIELD_CLASS_BIT(SNorm);
     STRINGISE_BITFIELD_CLASS_BIT(Truncated);
     STRINGISE_BITFIELD_CLASS_BIT(SignedEnum);
+    STRINGISE_BITFIELD_CLASS_BIT(SingleElementArray);
   }
   END_BITFIELD_STRINGISE();
 }

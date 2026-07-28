@@ -1,7 +1,7 @@
 /******************************************************************************
  * The MIT License (MIT)
  *
- * Copyright (c) 2019-2025 Baldur Karlsson
+ * Copyright (c) 2015-2026 Baldur Karlsson
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -2392,7 +2392,7 @@ void TextureViewer::OpenResourceContextMenu(ResourceId id, bool input,
       m_Ctx.GetResourceInspector()->Inspect(id);
     });
 
-    CombineUsageEvents(m_Ctx, usage,
+    CombineUsageEvents(m_Ctx, usage, false,
                        [this, &contextMenu](uint32_t start, uint32_t end, ResourceUsage use) {
                          AddResourceUsageEntry(contextMenu, start, end, use);
                        });
